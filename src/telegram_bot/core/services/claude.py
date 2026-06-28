@@ -43,6 +43,7 @@ from telegram_bot.core.services.cc_modes import (
     FREE_MODE_TOOLS,
     KNOWLEDGE_MODE_PROMPT,
     KNOWLEDGE_MODE_TOOLS,
+    MEETING_MODE_TOOLS,
     PROJECT_MODE_PROMPT,
     PROJECT_MODE_TOOLS,
     TASK_MODE_PROMPT,
@@ -92,6 +93,9 @@ __all__ = [
 ]
 
 _POLL_SEC = 30.0  # readline poll interval for inactivity check (not user-facing)
+# Canonical tool set for the mute meeting agent — the fail-closed guard
+# (`_assert_meeting_least_privilege`) compares the live allowlist against this.
+_MEETING_EXPECTED_TOOLS = MEETING_MODE_TOOLS
 _MODEL_OVERRIDE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 
 
@@ -263,6 +267,11 @@ class SessionManager:
         """
         thread_id = channel_key[1]
         if self._topic_config is None or thread_id is None:
+            return
+        # A locked session means a stream is in flight — mutating engine/model/
+        # cwd mid-stream corrupts retry and session-save logic. The next prompt
+        # acquires the lock after _get_session, so it still picks up fresh config.
+        if session.lock.locked():
             return
 
         topic = self._topic_config.get_topic(thread_id)
@@ -750,7 +759,15 @@ class SessionManager:
             cleanup_runtime_mcp_config()
             raise CCTimeoutError from None
         except Exception:
+            # Same teardown as the timeout branch: without the kill the CC
+            # subprocess survives the exception as an orphan, and the stale
+            # session.process reference makes the next prompt think a stream
+            # is still running.
+            await self._kill_process(process)
             await cleanup_runtime_mcp_processes()
+            async with session.process_lock:
+                if session.process is process:
+                    session.process = None
             if stderr_task is not None:
                 stderr_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -820,6 +837,113 @@ class SessionManager:
         logger.info("CC stream done, session_id=%s", session.session_id)
 
         return result_text
+
+    def _assert_meeting_least_privilege(self, mcp_config: str) -> None:
+        """Fail-closed guard for the mute meeting agent (sec-audit #5).
+
+        bypassPermissions auto-approves the permission prompt, so the
+        --allowedTools allowlist is the ONLY thing keeping this agent from
+        escalating. Any drift (a typo, a prompt fallback, an accidental
+        Singularity `extend_mode_tools`, a swapped MCP config) must crash the
+        run instead of silently widening the agent's reach.
+        """
+        tools = self._mode_tools["meeting"]
+        if tools != _MEETING_EXPECTED_TOOLS:
+            raise RuntimeError(f"meeting tool allowlist drifted: {tools!r}")
+        if Path(mcp_config).name != "meeting-trigger.json":
+            raise RuntimeError(
+                f"meeting mcp config must be meeting-trigger.json, got {mcp_config!r}"
+            )
+        try:
+            servers = set(
+                json.loads(Path(mcp_config).read_text(encoding="utf-8")).get("mcpServers", {})
+            )
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"meeting mcp config unreadable: {mcp_config}") from exc
+        if servers != {"meetings", "contacts"}:
+            raise RuntimeError(f"meeting mcp config has unexpected servers: {servers}")
+
+    async def run_meeting_capture(
+        self,
+        prompt: str,
+        *,
+        mcp_config: str,
+        session_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        """Run the mute meeting agent once and capture its final text + session_id.
+
+        Self-contained captured (non-streaming) path used by the meeting-trigger
+        feature. It deliberately does NOT route through
+        ``ensure_bot_runtime_mcp_config`` (the agent gets no bot server) and does
+        NOT touch the channel-keyed session store — the caller owns the returned
+        ``session_id`` and feeds it back via ``session_id=`` to resume a
+        clarification dialogue across chats (the built-in reply-to-resume is
+        channel-locked and cannot bridge group → "Встречи" topic).
+
+        Pass ``session_id=None`` for a fresh run, or a prior id to resume.
+        """
+        self._assert_meeting_least_privilege(mcp_config)
+        cmd = self._build_command(prompt, session_id, mode="meeting", mcp_config=mcp_config)
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            cwd=self._settings.project_root,
+            limit=10 * 1024 * 1024,
+        )
+
+        stderr_buffer: collections.deque[str] = collections.deque(maxlen=256)
+
+        async def drain_stderr() -> None:
+            if process.stderr is None:
+                return
+            while True:
+                chunk = await process.stderr.read(4096)
+                if not chunk:
+                    break
+                stderr_buffer.append(chunk.decode(errors="replace"))
+
+        async def _discard(_event: StreamEvent) -> None:
+            return None
+
+        stderr_task = asyncio.create_task(drain_stderr())
+        try:
+            result_text, new_session_id = await asyncio.wait_for(
+                self._read_stream(process, _discard, provider="claude"),
+                timeout=self._settings.cc_query_timeout_sec,
+            )
+        except TimeoutError:
+            await self._kill_process(process)
+            stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stderr_task
+            raise CCTimeoutError from None
+        except BaseException:
+            await self._kill_process(process)
+            stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stderr_task
+            raise
+
+        try:
+            await asyncio.wait_for(process.wait(), timeout=self._settings.cc_wait_timeout_sec)
+        except TimeoutError:
+            await self._kill_process(process)
+        with contextlib.suppress(asyncio.CancelledError):
+            await stderr_task
+
+        stderr_text = "".join(stderr_buffer)
+        if stderr_text:
+            logger.info("meeting CC stderr:\n%s", stderr_text[-2000:])
+        if process.returncode and process.returncode != 0 and not result_text:
+            logger.warning(
+                "meeting CC exited code %d, stderr: %s",
+                process.returncode,
+                stderr_text[-500:] or "(empty)",
+            )
+            raise CCProcessError(process.returncode)
+        return result_text, new_session_id
 
     async def _read_stream(
         self,
@@ -903,7 +1027,10 @@ class SessionManager:
                 idle_start = None
                 continue
 
-            if event_type in ("system", "assistant", "result"):
+            # "user" events are tool results streamed back by CC — a long
+            # tool-heavy run can emit only those for minutes; they prove the
+            # process is alive and must reset the inactivity timer too.
+            if event_type in ("system", "assistant", "user", "result"):
                 idle_start = None
                 continue
 
@@ -1018,8 +1145,13 @@ class SessionManager:
                         # Kill old process before retry to prevent zombie processes
                         if session.process is not None:
                             await self._kill_process(session.process)
-                        # SIGTERM without cancel — preserve session for retry
-                        if isinstance(exc, CCProcessError) and exc.exit_code == 143:
+                        # SIGTERM without cancel — preserve session for retry.
+                        # asyncio reports signal death as a negative returncode
+                        # (-15 for SIGTERM); 143 covers shell-wrapped exits.
+                        if isinstance(exc, CCProcessError) and exc.exit_code in (
+                            143,
+                            -signal.SIGTERM,
+                        ):
                             logger.info(
                                 "SIGTERM, preserving session_id=%s for retry",
                                 session.session_id,
@@ -1374,20 +1506,28 @@ class SessionManager:
             if isinstance(data, dict):
                 migrated = 0
                 for k, v in data.items():
-                    if isinstance(v, str):
-                        self._msg_sessions[int(k)] = v
-                    elif isinstance(v, dict) and "session_id" in v:
-                        self._msg_sessions[int(k)] = {
-                            "provider": str(v.get("provider", "claude")),
-                            "session_id": str(v["session_id"]),
-                            "channel_key": str(v.get("channel_key", "")),
-                            "model": v.get("model") if isinstance(v.get("model"), str) else None,
-                        }
-                    elif isinstance(v, dict) and "s" in v:
-                        # Old dict format: extract session_id
-                        self._msg_sessions[int(k)] = str(v["s"])
-                        migrated += 1
-                    else:
+                    # Per-entry guard: one malformed key (e.g. non-numeric)
+                    # must not abort the load and silently drop the rest of
+                    # the mapping — that loses resume for every later message.
+                    try:
+                        if isinstance(v, str):
+                            self._msg_sessions[int(k)] = v
+                        elif isinstance(v, dict) and "session_id" in v:
+                            self._msg_sessions[int(k)] = {
+                                "provider": str(v.get("provider", "claude")),
+                                "session_id": str(v["session_id"]),
+                                "channel_key": str(v.get("channel_key", "")),
+                                "model": (
+                                    v.get("model") if isinstance(v.get("model"), str) else None
+                                ),
+                            }
+                        elif isinstance(v, dict) and "s" in v:
+                            # Old dict format: extract session_id
+                            self._msg_sessions[int(k)] = str(v["s"])
+                            migrated += 1
+                        else:
+                            logger.debug("Skipping invalid mapping entry: %s -> %s", k, v)
+                    except (ValueError, TypeError):
                         logger.debug("Skipping invalid mapping entry: %s -> %s", k, v)
                 logger.info(
                     "Loaded %d message→session mappings (%d migrated from old format)",
@@ -1427,18 +1567,32 @@ class SessionManager:
                     "Failed to load channel sessions from %s", self._channel_sessions_path
                 )
 
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: object) -> None:
+        """Write JSON atomically: temp file in the same dir + os.replace.
+
+        A crash mid-write must not leave a truncated file — these mappings
+        are the only way to resume sessions after restart.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, json.dumps(payload).encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+
     def _save_channel_sessions(self) -> None:
         """Write channel→session mapping to disk (called after each stream and on shutdown)."""
         try:
-            self._channel_sessions_path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(
-                str(self._channel_sessions_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
-            )
-            try:
-                os.write(fd, json.dumps(self._channel_sessions).encode())
-            finally:
-                os.close(fd)
-            os.chmod(self._channel_sessions_path, 0o600)
+            self._atomic_write_json(self._channel_sessions_path, self._channel_sessions)
         except OSError:
             logger.warning(
                 "Failed to save channel sessions to %s",
@@ -1449,15 +1603,8 @@ class SessionManager:
     def save_mapping(self) -> None:
         """Save message→session and channel→session mappings to JSON files."""
         try:
-            self._mapping_path.parent.mkdir(parents=True, exist_ok=True)
             data = {str(k): v for k, v in self._msg_sessions.items()}
-            # Create with 0600 (avoids TOCTOU window for new files), chmod for existing
-            fd = os.open(str(self._mapping_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            try:
-                os.write(fd, json.dumps(data).encode())
-            finally:
-                os.close(fd)
-            os.chmod(self._mapping_path, 0o600)
+            self._atomic_write_json(self._mapping_path, data)
             logger.info("Saved %d message→session mappings", len(data))
         except OSError:
             logger.warning(

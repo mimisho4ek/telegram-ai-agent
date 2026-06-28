@@ -28,6 +28,39 @@ logger = logging.getLogger(__name__)
 _VERBOSE_SEND_LOGS = os.environ.get("TELEGRAM_VERBOSE_SEND_LOGS") == "1"
 
 
+async def send_placeholder(
+    send: Callable[[], Awaitable[Any]],
+    label: str,
+    flood_retry_limit: float = 5.0,
+) -> Any | None:
+    """Send a cosmetic placeholder ("Thinking…", "Recognizing…") without raising.
+
+    Placeholders are UX sugar — losing one must never lose the user's prompt.
+    Before this helper a TelegramRetryAfter on the placeholder propagated into
+    MessageQueue._process_next, which drops the queue item: the user's message
+    silently vanished because a status bubble couldn't be posted.
+
+    On TelegramRetryAfter with a short retry_after (<= flood_retry_limit) we
+    sleep and retry once; longer waits or any other failure degrade to None —
+    the caller proceeds without a placeholder.
+    """
+    try:
+        return await send()
+    except TelegramRetryAfter as e:
+        logger.warning("Flood wait on %s: retry_after=%ds", label, e.retry_after)
+        if e.retry_after > flood_retry_limit:
+            return None
+        await asyncio.sleep(e.retry_after)
+        try:
+            return await send()
+        except Exception:
+            logger.warning("Retry of %s failed", label, exc_info=True)
+            return None
+    except Exception:
+        logger.warning("%s failed — proceeding without placeholder", label, exc_info=True)
+        return None
+
+
 @dataclass(frozen=True)
 class SendOutcome:
     """Result of a send attempt through send_html_with_fallback.

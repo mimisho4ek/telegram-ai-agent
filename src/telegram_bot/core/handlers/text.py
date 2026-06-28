@@ -9,7 +9,7 @@ from aiogram import F, Router
 from aiogram.types import Message
 
 from telegram_bot.core.handlers._dispatch import enqueue_prompt
-from telegram_bot.core.handlers.forward import ForwardBatcher, unparse_entities
+from telegram_bot.core.handlers.forward import ForwardBatcher
 from telegram_bot.core.handlers.streaming import (
     ensure_exec_mode_ready,
     send_to_tmux_if_active,
@@ -18,6 +18,7 @@ from telegram_bot.core.messages import t
 from telegram_bot.core.services.claude import SessionManager
 from telegram_bot.core.services.message_queue import MessageQueue
 from telegram_bot.core.services.providers import engine_display_name
+from telegram_bot.core.services.rich_content import normalize_telegram_content
 from telegram_bot.core.services.tmux_manager import TmuxManager
 from telegram_bot.core.services.topic_config import TopicConfig
 from telegram_bot.core.tui.routing import route_slash_command
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 router = Router(name="text")
 
 
-@router.message(F.text)
+@router.message(F.text | F.rich_message)
 async def handle_text(
     message: Message,
     session_manager: SessionManager,
@@ -40,7 +41,7 @@ async def handle_text(
 ) -> None:
     # User's own messages are trusted — no sanitize_forwarded_content() needed here.
     # If multi-user access is added, apply sanitization like in forward.py.
-    text = unparse_entities(message.text, message.entities)
+    text = (await normalize_telegram_content(message)).text
     if not text.strip():
         return
 

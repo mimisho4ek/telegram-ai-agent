@@ -354,12 +354,30 @@ async def run_recovery_tail(
     user message cancels it via cancel_event, or the tmux session dies.
     This handles the case where CC is mid-Bash-command at restart and
     hasn't written to the transcript yet when resume_tails runs.
+
+    Wraps on_event to clear `manager._is_processing` on response delivery
+    (result / result_message / text). send_direct sets the flag for every
+    prompt routed through an active recovery tail; without this clear the
+    flag stays True forever (the recovery on_event in __main__ never touches
+    it, and the Claude TUI transcript has no terminal event), permanently
+    busy-rejecting /mode, /engine, and /recycle.
     """
+
+    async def _on_event_clearing(event: StreamEvent) -> None:
+        if event.type == "result":
+            manager._is_processing[channel_key] = False
+            return
+        ret = on_event(event)
+        if asyncio.iscoroutine(ret):
+            await ret
+        if event.type in ("result_message", "text"):
+            manager._is_processing[channel_key] = False
+
     try:
         _result_text, _new_session_id = await manager._tail_until_done(
             output_path,
             state,
-            on_event,
+            _on_event_clearing,
             cancel_event,
             idle_exit_sec=None,
         )
@@ -380,4 +398,11 @@ async def run_recovery_tail(
         )
         if manager._cancel_events.get(channel_key) is cancel_event:
             manager._cancel_events.pop(channel_key, None)
+        if not cancel_event.is_set():
+            # Tail died on its own (tmux death, timeout) — nothing left to
+            # clear the processing flag, so drop it here. On cancel the
+            # canceller (send_stream / cancel / clear_context) owns the flag:
+            # send_stream sets it True for the next prompt right before
+            # cancelling this tail, and popping it here would erase that.
+            manager._is_processing.pop(channel_key, None)
         await manager.close_buffer(channel_key)

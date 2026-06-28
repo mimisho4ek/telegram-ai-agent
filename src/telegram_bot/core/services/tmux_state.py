@@ -224,15 +224,20 @@ class StateStore:
         )
         try:
             fd = os.open(tmp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            # Close fd manually only when fdopen itself fails: once fdopen
+            # succeeds the file object owns the fd, and an extra os.close after
+            # `with` would double-close — possibly killing an fd another thread
+            # already reused.
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
+                f = os.fdopen(fd, "w", encoding="utf-8")
             except Exception:
                 with contextlib.suppress(OSError):
                     os.close(fd)
                 raise
+            with f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, self._state_path)
             self._fsync_dir(self._state_path.parent)
         except Exception:

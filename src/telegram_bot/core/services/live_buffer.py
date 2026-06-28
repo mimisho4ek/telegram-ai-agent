@@ -23,8 +23,10 @@ Threading model:
 - `append` only mutates the in-memory buffer; it never awaits Telegram.
   This is deliberate: callers live inside tmux_manager._sender_loop, and
   we don't want a flood wait on edit to back-pressure the sender.
-- Flood waits inside `_worker` are logged and slept; on the next tick
-  we retry with whatever is pending.
+- Flood waits are never slept (sleeping inside `_rotate_locked` held the
+  buffer lock and froze `append` for the whole retry_after). Instead the
+  deadline is recorded in `_flood_until` and flushes are skipped until it
+  passes; the dirty flag keeps the pending content alive for the retry.
 - `close` sets a closed flag, cancels the worker, and awaits it. Safe to
   call repeatedly.
 """
@@ -82,6 +84,7 @@ class LiveStatusBuffer:
         self._closed = False
         self._lock = asyncio.Lock()
         self._last_rotate: float = time.monotonic()
+        self._flood_until: float = 0.0  # monotonic deadline of the last flood wait
         self._last_edit_text: str = ""  # skip no-op edits
         self._message_ids: list[int] = [initial_message_id]  # all pages we've posted
 
@@ -155,6 +158,10 @@ class LiveStatusBuffer:
 
     async def _flush_if_dirty(self, *, final: bool) -> None:
         """Edit the current page with the latest content, rotating when full."""
+        if time.monotonic() < self._flood_until:
+            # Applies to final flushes too: an edit during an active flood
+            # window is a guaranteed second 429 that extends the penalty.
+            return
         async with self._lock:
             if not self._dirty and not final:
                 return
@@ -183,8 +190,12 @@ class LiveStatusBuffer:
                         self._lines.pop(0)
                     text = self._render()
 
-        await self._edit(self._current_message_id, text)
-        self._last_edit_text = text
+        if await self._edit(self._current_message_id, text):
+            self._last_edit_text = text
+        else:
+            # Flood wait — keep the content dirty so the next tick retries it.
+            async with self._lock:
+                self._dirty = True
 
     def _render(self) -> str:
         # header_text and _is_continuation are mutually exclusive: the first page
@@ -205,7 +216,7 @@ class LiveStatusBuffer:
         Returns False if rotation is skipped due to min-interval throttling.
         """
         now = time.monotonic()
-        if now - self._last_rotate < self._rotate_min_interval:
+        if now - self._last_rotate < self._rotate_min_interval or now < self._flood_until:
             return False
         self._last_rotate = now
 
@@ -228,7 +239,8 @@ class LiveStatusBuffer:
 
     # --- Telegram plumbing ---
 
-    async def _edit(self, message_id: int, text: str) -> None:
+    async def _edit(self, message_id: int, text: str) -> bool:
+        """Edit a page. Returns False only on flood wait (content should be retried)."""
         try:
             await self._bot.edit_message_text(
                 text=text,
@@ -236,6 +248,7 @@ class LiveStatusBuffer:
                 message_id=message_id,
                 parse_mode=ParseMode.HTML,
             )
+            return True
         except TelegramRetryAfter as e:
             logger.warning(
                 "LiveStatusBuffer flood wait on edit (chat %s, msg %s): retry_after=%ds",
@@ -243,17 +256,21 @@ class LiveStatusBuffer:
                 message_id,
                 e.retry_after,
             )
-            await asyncio.sleep(e.retry_after)
-            # No retry here — worker wakes on its next throttle and tries again.
+            # No sleep — close() awaits this path and a sleep would stall
+            # shutdown; record the deadline and let the next tick retry.
+            self._flood_until = time.monotonic() + e.retry_after
+            return False
         except TelegramBadRequest as e:
             if "message is not modified" in str(e).lower():
-                return
+                return True
             logger.warning(
                 "LiveStatusBuffer edit failed (chat %s, msg %s): %s",
                 self._chat_id,
                 message_id,
                 e,
             )
+            # Malformed text won't get better on retry — treat as consumed.
+            return True
 
     async def _send_new_page(self) -> int | None:
         try:
@@ -271,7 +288,10 @@ class LiveStatusBuffer:
                 self._chat_id,
                 e.retry_after,
             )
-            await asyncio.sleep(e.retry_after)
+            # Caller (_rotate_locked) holds the buffer lock — sleeping here
+            # froze append() for the whole retry_after. Record the deadline
+            # instead; _rotate_locked skips rotation until it passes.
+            self._flood_until = time.monotonic() + e.retry_after
             return None
         except Exception:
             logger.warning("LiveStatusBuffer failed to send new page", exc_info=True)

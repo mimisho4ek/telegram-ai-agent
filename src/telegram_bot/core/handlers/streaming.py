@@ -13,14 +13,19 @@ from typing import Any
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import Message
-from aiogram.utils.text_decorations import HtmlDecoration
 
 from telegram_bot.core.keyboards import topic_keyboard
 from telegram_bot.core.messages import t
 from telegram_bot.core.services.claude import SessionManager, StreamEvent
 from telegram_bot.core.services.live_buffer import LiveStatusBuffer
 from telegram_bot.core.services.providers import choose_available_engine, engine_display_name
-from telegram_bot.core.services.telegram_utils import send_html_with_fallback
+from telegram_bot.core.services.rich_content import normalize_telegram_text_content
+from telegram_bot.core.services.rich_sender import send_rich_final_answer
+from telegram_bot.core.services.telegram_utils import (
+    SendOutcome,
+    send_html_with_fallback,
+    send_placeholder,
+)
 from telegram_bot.core.services.tmux_manager import TmuxManager
 from telegram_bot.core.services.topic_config import StreamMode, TopicConfig
 from telegram_bot.core.types import ChannelKey
@@ -68,8 +73,6 @@ def _resolve_stream_mode(
     return topic_config.get_topic(thread_id).stream_mode
 
 
-_html_decorator = HtmlDecoration()
-
 _MAX_REPLY_CONTEXT_LEN = 2000
 
 
@@ -100,14 +103,7 @@ def build_reply_context(message: Message) -> str | None:
     reply = message.reply_to_message
     if reply is None:
         return None
-    text = reply.text
-    entities = reply.entities
-    if text is None:
-        text = reply.caption
-        entities = reply.caption_entities
-    if not text:
-        return None
-    result = _html_decorator.unparse(text, entities) if entities else text
+    result = normalize_telegram_text_content(reply).text
     if not result:
         return None
     if len(result) > _MAX_REPLY_CONTEXT_LEN:
@@ -161,9 +157,12 @@ async def send_to_tmux_if_active(
 
     cmd = prompt.split()[0] if prompt.startswith("/") else None
     thinking_text = t("ui.running_command", command=cmd) if cmd else t("ui.thinking")
-    thinking_msg = await source_msg.answer(thinking_text, disable_notification=True)
+    thinking_msg = await send_placeholder(
+        lambda: source_msg.answer(thinking_text, disable_notification=True),
+        label="thinking placeholder (tmux)",
+    )
 
-    if stream_mode == "live" and tmux_manager.live_buffer_available():
+    if stream_mode == "live" and tmux_manager.live_buffer_available() and thinking_msg is not None:
         bot = tmux_manager.get_live_bot()
         new_buffer = LiveStatusBuffer(
             bot=bot,  # type: ignore[arg-type]
@@ -184,8 +183,9 @@ async def send_to_tmux_if_active(
         # already posted a modal alert with the pane snapshot; after
         # the user dismisses the modal and resends, a fresh placeholder
         # spawns for that next attempt.
-        with contextlib.suppress(TelegramAPIError):
-            await thinking_msg.delete()
+        if thinking_msg is not None:
+            with contextlib.suppress(TelegramAPIError):
+                await thinking_msg.delete()
         await tmux_manager.close_buffer(key)
     return True
 
@@ -496,8 +496,43 @@ async def _send_final_response(ctx: _StreamCtx, final_text: str) -> None:
     is_group = ctx.message.chat.type == ChatType.SUPERGROUP
     reply_kb = topic_keyboard() if is_group else None
 
-    chunks = split_html_message(final_text)
     response_message_ids: list[int] = []
+
+    async def _send_legacy_final() -> SendOutcome:
+        return await _send_legacy_final_response(ctx, final_text, reply_kb, response_message_ids)
+
+    if not ctx.send_failed:
+        outcome = await send_rich_final_answer(
+            final_text=final_text,
+            send_rich=lambda rich_message: ctx.message.answer_rich(
+                rich_message,
+                reply_markup=reply_kb,
+            ),
+            legacy_fallback=_send_legacy_final,
+            label=f"final_rich {ctx.channel_key}",
+            flood_retry_limit=300.0,
+        )
+        if not response_message_ids and outcome.message_id is not None:
+            response_message_ids.append(outcome.message_id)
+        if outcome.fatal:
+            ctx.send_failed = True
+
+    # Record only final response message IDs for reply-to-resume
+    # (users reply to responses, not intermediate status messages).
+    current_sid = ctx.session_manager.get_current_session_id(ctx.channel_key)
+    if current_sid:
+        for msg_id in response_message_ids:
+            ctx.session_manager.record_message(msg_id, current_sid, ctx.channel_key)
+
+
+async def _send_legacy_final_response(
+    ctx: _StreamCtx,
+    final_text: str,
+    reply_kb: Any,
+    response_message_ids: list[int],
+) -> SendOutcome:
+    """Send final answer through the established HTML/plain fallback path."""
+    chunks = split_html_message(final_text)
     for chunk in chunks:
         if ctx.send_failed:
             break
@@ -518,13 +553,9 @@ async def _send_final_response(ctx: _StreamCtx, final_text: str) -> None:
             response_message_ids.append(outcome.message_id)
         if outcome.fatal:
             ctx.send_failed = True
-
-    # Record only final response message IDs for reply-to-resume
-    # (users reply to responses, not intermediate status messages).
-    current_sid = ctx.session_manager.get_current_session_id(ctx.channel_key)
-    if current_sid:
-        for msg_id in response_message_ids:
-            ctx.session_manager.record_message(msg_id, current_sid, ctx.channel_key)
+            return outcome
+    last_id = response_message_ids[-1] if response_message_ids else None
+    return SendOutcome(message_id=last_id, fatal=ctx.send_failed)
 
 
 async def send_streaming_response(
@@ -580,8 +611,12 @@ async def send_streaming_response(
         await message.answer(t("ui.tmux_failed", exc="tmux session is not active"))
         return
 
-    thinking_msg = await message.answer(thinking_text, disable_notification=True)
-    sent_message_ids.append(thinking_msg.message_id)
+    thinking_msg = await send_placeholder(
+        lambda: message.answer(thinking_text, disable_notification=True),
+        label="thinking placeholder (subprocess)",
+    )
+    if thinking_msg is not None:
+        sent_message_ids.append(thinking_msg.message_id)
 
     # Materialize a LiveStatusBuffer for live-mode. For tmux it's registered
     # on the manager so on_event (which may fire from a long-running tail)
@@ -592,6 +627,7 @@ async def send_streaming_response(
         stream_mode == "live"
         and message.bot is not None
         and not used_tmux  # tmux case wires a fresh buffer below
+        and thinking_msg is not None  # no placeholder → nothing to edit, fall back to verbose
     ):
         live_buffer = LiveStatusBuffer(
             bot=message.bot,
@@ -606,6 +642,7 @@ async def send_streaming_response(
         and tmux_manager is not None
         and tmux_manager.live_buffer_available()
         and message.bot is not None
+        and thinking_msg is not None
     ):
         bot = tmux_manager.get_live_bot()
         tmux_buffer = LiveStatusBuffer(

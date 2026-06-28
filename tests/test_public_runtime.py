@@ -11,6 +11,7 @@ from telegram_bot.core.services import cc_modes
 from telegram_bot.core.services.bot_commands import build_bot_commands
 from telegram_bot.core.services.claude import SessionManager
 from telegram_bot.core.services.providers import CODEX_ADAPTER, choose_available_engine
+from telegram_bot.core.services.rich_sender import detect_rich_send
 from telegram_bot.core.services.topic_config import TopicConfig
 
 
@@ -191,3 +192,13 @@ def test_mcp_bot_server_imports() -> None:
     invalid_mode, error = module._normalize_parse_mode("Markdown")
     assert invalid_mode is None
     assert error is not None
+
+
+def test_public_rich_final_answer_detection_requires_table() -> None:
+    plain = detect_rich_send("Final answer without a table.")
+    table = detect_rich_send("| Feature | Status |\n| --- | --- |\n| Tables | work |")
+
+    assert not plain.eligible
+    assert plain.reason == "plain-no-rich-structure"
+    assert table.eligible
+    assert table.input_rich_message is not None

@@ -35,6 +35,13 @@ logger = logging.getLogger(__name__)
 # so the receiving end never reads it from the user payload.)
 _BRACKETED_PASTE_END = "\x1b[201~"
 
+# Hard ceiling for any single tmux command. tmux replies in milliseconds;
+# without a timeout a hung tmux server blocks the to_thread forever — and
+# the caller usually holds the per-channel lifecycle lock, freezing the
+# whole channel. TimeoutExpired is a SubprocessError, so existing callers
+# already handle it.
+_TMUX_CMD_TIMEOUT_SEC = 10.0
+
 # Legacy constants — kept so tests/integration/tui_helpers.py and the
 # existing smoke tests that read them keep importing cleanly. The
 # bracketed-paste path no longer applies char/newline thresholds.
@@ -98,12 +105,14 @@ async def send_paste(session_name: str, text: str) -> None:
             ["tmux", "load-buffer", "-b", buffer_name, "-"],
             input=sanitized.encode("utf-8"),
             check=True,
+            timeout=_TMUX_CMD_TIMEOUT_SEC,
         )
         loaded = True
         await asyncio.to_thread(
             subprocess.run,
             ["tmux", "paste-buffer", "-p", "-b", buffer_name, "-t", f"={session_name}:"],
             check=True,
+            timeout=_TMUX_CMD_TIMEOUT_SEC,
         )
     finally:
         # Only attempt cleanup if load-buffer succeeded — if it didn't,
@@ -117,6 +126,7 @@ async def send_paste(session_name: str, text: str) -> None:
                 ["tmux", "delete-buffer", "-b", buffer_name],
                 check=False,
                 capture_output=True,
+                timeout=_TMUX_CMD_TIMEOUT_SEC,
             )
             if cleanup.returncode != 0:
                 logger.warning(
@@ -147,6 +157,7 @@ async def send_text_to_tmux(
             subprocess.run,
             ["tmux", "send-keys", "-t", f"={session_name}:", "Enter"],
             check=True,
+            timeout=_TMUX_CMD_TIMEOUT_SEC,
         )
 
 
@@ -155,6 +166,7 @@ async def send_enter(session_name: str) -> None:
         subprocess.run,
         ["tmux", "send-keys", "-t", f"={session_name}:", "Enter"],
         check=True,
+        timeout=_TMUX_CMD_TIMEOUT_SEC,
     )
 
 
@@ -163,6 +175,7 @@ async def send_tab(session_name: str) -> None:
         subprocess.run,
         ["tmux", "send-keys", "-t", f"={session_name}:", "Tab"],
         check=True,
+        timeout=_TMUX_CMD_TIMEOUT_SEC,
     )
 
 
@@ -171,4 +184,5 @@ async def send_ctrl_u(session_name: str) -> None:
         subprocess.run,
         ["tmux", "send-keys", "-t", f"={session_name}:", "C-u"],
         check=True,
+        timeout=_TMUX_CMD_TIMEOUT_SEC,
     )

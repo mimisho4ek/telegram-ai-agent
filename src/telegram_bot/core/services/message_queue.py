@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -35,6 +36,10 @@ class ChatQueue:
     items: collections.deque[QueueItem] = field(default_factory=collections.deque)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     error_count: int = 0
+    # Interrupts the error-backoff sleep in _process_next. The sleep happens
+    # under `lock`, so without this clear()/cancel() would wait out the full
+    # backoff (up to 30s) before they can acquire the lock.
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 # Type alias for the process callback
@@ -269,7 +274,16 @@ class MessageQueue:
                         backoff_sec,
                         exc_info=True,
                     )
-                    await asyncio.sleep(backoff_sec)
+                    # clear() before the notification await: a wake.set() fired
+                    # during _send_notification must not be erased, or clear()/
+                    # cancel() would wait out the full backoff.
+                    queue.wake.clear()
+                    # Silent loss is worse than noise: tell the user their
+                    # message died so they can resend instead of waiting on
+                    # a "Thinking…" that will never resolve.
+                    await self._send_notification(channel_key, t("ui.queue_item_dropped"))
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(queue.wake.wait(), timeout=backoff_sec)
 
     async def clear(self, channel_key: ChannelKey) -> None:
         """Clear the queue for a channel: wait for active processing, then discard pending items."""
@@ -287,6 +301,7 @@ class MessageQueue:
         await self._session_manager.cancel(channel_key)
 
         # Wait for processing to finish, then clear under lock
+        queue.wake.set()  # interrupt a possible error-backoff sleep
         async with queue.lock:
             queue.items.clear()
 
@@ -298,17 +313,34 @@ class MessageQueue:
         queue = self._get_queue(channel_key)
         dropped = len(queue.items)
         queue.items.clear()
+        queue.wake.set()  # interrupt a possible error-backoff sleep
 
         stopped = await self._session_manager.cancel(channel_key)
         return stopped or dropped > 0
 
     async def shutdown(self) -> None:
-        """Cancel background tasks, clear all queues."""
+        """Cancel background tasks, notify owners of dropped items, clear all queues."""
         # Cancel notification tasks
         for task in self._background_tasks:
             task.cancel()
         await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._background_tasks.clear()
+
+        # Pending items die with the restart — tell each affected channel so
+        # the user resends instead of waiting on a reply that never comes.
+        affected = [key for key, queue in self._queues.items() if queue.items]
+        if affected:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *[
+                            self._send_notification(key, t("ui.queue_dropped_shutdown"))
+                            for key in affected
+                        ],
+                        return_exceptions=True,
+                    ),
+                    timeout=5.0,
+                )
 
         # Clear all channel queues (items only — lock releases naturally)
         for _channel_key, queue in self._queues.items():

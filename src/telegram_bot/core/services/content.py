@@ -24,6 +24,18 @@ logger = logging.getLogger(__name__)
 
 
 async def extract_content(message: Message, bot: Bot, transcriber: Transcriber) -> str | None:
+    """Extract message content via the shared rich-aware normalizer."""
+    from telegram_bot.core.services.rich_content import normalize_telegram_content
+
+    if getattr(message, "rich_message", None):
+        normalized = await normalize_telegram_content(message, bot=bot, transcriber=transcriber)
+        return normalized.text or None
+    return await extract_legacy_content(message, bot, transcriber)
+
+
+async def extract_legacy_content(
+    message: Message, bot: Bot, transcriber: Transcriber
+) -> str | None:
     """Extract message content as text string.
 
     Returns:

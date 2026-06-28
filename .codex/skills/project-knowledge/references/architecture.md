@@ -5,7 +5,7 @@ The bot runtime is split into:
 
 - `src/telegram_bot/__main__.py` - public entry point, aiogram wiring, shutdown.
 - `src/telegram_bot/core/handlers/` - Telegram command, text, media, voice, forward, topic, and TUI handlers.
-- `src/telegram_bot/core/services/` - session management, provider adapters, topic config, streaming, tmux, resume, MCP runtime, and transcription.
+- `src/telegram_bot/core/services/` - session management, provider adapters, topic config, streaming, tmux, resume, MCP runtime, transcription, and rich final-answer rendering.
 - `src/telegram_bot/core/tui/` - tmux TUI capture, modal detection, keyboard controls, routing, and transcript helpers.
 - `mcp-servers/bot/` - MCP server that lets an agent send messages, images,
   image galleries, and files back to Telegram.
@@ -25,6 +25,12 @@ online with a user-facing install message when neither CLI is available.
 - `verbose`: separate progress messages.
 - `live`: editable progress buffer plus final answer.
 - `minimal`: final-answer oriented delivery.
+
+Rich message rendering is intentionally narrow: intermediate progress always
+stays plain, and only final answers with Markdown tables are eligible for
+Telegram RichText/RichMessage delivery. Unsupported rich payloads fall back to
+plain Telegram text. Telegram's schema starts at
+https://core.telegram.org/type/RichText.
 
 Forum topics are isolated by `(chat_id, thread_id)`. Session mappings and tmux
 state are runtime files and must not be committed.

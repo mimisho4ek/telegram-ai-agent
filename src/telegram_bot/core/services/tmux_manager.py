@@ -150,6 +150,10 @@ logger = logging.getLogger(__name__)
 # prompts without bloating journald.
 _MODAL_DIAG_PANE_TAIL_LINES = 30
 
+# Same rationale as send_keys._TMUX_CMD_TIMEOUT_SEC: a hung tmux server must
+# not block callers holding the per-channel lifecycle lock forever.
+_TMUX_CMD_TIMEOUT_SEC = 10.0
+
 
 # Tail-loop constants live in tail_runner.py (W2.3 extraction).
 _POLL_STEP_SEC = 0.05  # fine-grained poll interval inside send_direct's pane-verify loop
@@ -378,6 +382,15 @@ class TmuxManager:
             return False
         state = self._sessions[channel_key]
         return self._tmux_alive(state.session_name)
+
+    def active_session_count(self) -> int:
+        """Number of channels with a tracked tmux session.
+
+        Best-effort context for the health watchdog's alerts — counts known
+        session state without probing tmux, so it stays cheap on the poll
+        cadence.
+        """
+        return len(self._sessions)
 
     def get_session_id(self, channel_key: ChannelKey) -> str | None:
         """Return current CC session_id for a channel."""
@@ -737,9 +750,13 @@ class TmuxManager:
         else:
             ready = await await_prompt_ready(name, timeout=remaining, clock=time.monotonic)
         if not ready:
-            await asyncio.to_thread(
-                subprocess.run, ["tmux", "kill-session", "-t", f"={name}"], capture_output=True
-            )
+            with contextlib.suppress(subprocess.SubprocessError):
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["tmux", "kill-session", "-t", f"={name}"],
+                    capture_output=True,
+                    timeout=_TMUX_CMD_TIMEOUT_SEC,
+                )
             raise RuntimeError("CC TUI start timeout")
 
         # Second readiness gate: the prompt glyph (codex `>` / claude `>` markers) is visible, but
@@ -801,9 +818,13 @@ class TmuxManager:
             if CODEX_ADAPTER.is_prompt_ready(pane):
                 return True
             await asyncio.sleep(0.5)
-        await asyncio.to_thread(
-            subprocess.run, ["tmux", "kill-session", "-t", f"={session_name}"], capture_output=True
-        )
+        with contextlib.suppress(subprocess.SubprocessError):
+            await asyncio.to_thread(
+                subprocess.run,
+                ["tmux", "kill-session", "-t", f"={session_name}"],
+                capture_output=True,
+                timeout=_TMUX_CMD_TIMEOUT_SEC,
+            )
         return False
 
     async def _probe_input_ready(
@@ -1457,6 +1478,10 @@ class TmuxManager:
         8d1363a4) collapses correctly on the first Enter.
         """
         session_name = state.session_name
+        transcript_ack_path = self._transcript_path_for_state(state)
+        transcript_ack_offset = (
+            self._file_size(transcript_ack_path) if transcript_ack_path is not None else None
+        )
 
         pane_before = await capture_pane(session_name)
         if CODEX_ADAPTER.is_modal_present(pane_before):
@@ -1606,6 +1631,22 @@ class TmuxManager:
                 return False
 
             await asyncio.sleep(_ENTER_RETRY_SETTLE_SEC)
+            if (
+                transcript_ack_path is not None
+                and transcript_ack_offset is not None
+                and CODEX_ADAPTER.has_prompt_user_message_after(
+                    transcript_ack_path,
+                    offset=transcript_ack_offset,
+                    prompt=prompt,
+                )
+            ):
+                logger.info(
+                    "TUI_IO: codex Enter accepted via transcript ack session=%s attempt=%d",
+                    session_name,
+                    enter_attempt,
+                )
+                return True
+
             pane_after_enter = await capture_pane(session_name)
             if not pane_after_enter:
                 logger.warning(
@@ -2068,24 +2109,35 @@ class TmuxManager:
             )
             self._transcript_lag_warned.add(channel_key)
 
-        if lag_age < restart_after_sec:
+        effective_restart_after_sec = 0.0 if not tail_active else restart_after_sec
+        if lag_age < effective_restart_after_sec:
             return
         if self._recovery_on_event_factory is None:
             return
 
-        old_cancel = self._cancel_events.get(channel_key)
-        if old_cancel is not None:
-            old_cancel.set()
-            await self._wait_for_tail_exit(channel_key, timeout=2.5)
-            if self._cancel_events.get(channel_key) is old_cancel:
-                logger.warning(
-                    "Transcript watchdog replacing stale tail channel=%s session=%s: "
-                    "old tail did not exit before timeout",
-                    channel_key,
-                    state.session_name,
-                )
+        # Restart must not race lifecycle operations (send_stream's locked
+        # delivery, recycle, kill). If one is in flight, skip this probe —
+        # the next tick re-evaluates against fresh state.
+        lock = self._channel_locks.get(channel_key)
+        if lock is not None and lock.locked():
+            return
+        async with self._get_channel_lock(channel_key):
+            if self._sessions.get(channel_key) is not state:
+                # Session was killed/recycled between the probe and the lock.
+                return
+            old_cancel = self._cancel_events.get(channel_key)
+            if old_cancel is not None:
+                old_cancel.set()
+                await self._wait_for_tail_exit(channel_key, timeout=2.5)
+                if self._cancel_events.get(channel_key) is old_cancel:
+                    logger.warning(
+                        "Transcript watchdog replacing stale tail channel=%s session=%s: "
+                        "old tail did not exit before timeout",
+                        channel_key,
+                        state.session_name,
+                    )
 
-        started = await self._start_recovery_tail(channel_key, state, output_path)
+            started = await self._start_recovery_tail(channel_key, state, output_path)
         if started:
             self._is_processing[channel_key] = True
             self._transcript_lag_since[channel_key] = now
@@ -2170,14 +2222,27 @@ class TmuxManager:
             ret = on_event(event)
             if asyncio.iscoroutine(ret):
                 await ret
-            if event.type == "result_message":
+            if event.type in ("result_message", "text"):
                 # Clear after Telegram send completes — avoids starting a new
                 # "Thinking..." indicator while the result is still mid-post.
+                # `text` also clears: the Claude TUI transcript never emits
+                # result/result_message (text blocks ARE the response), so
+                # without this the flag stays True until the tail dies and
+                # /mode, /engine, /recycle busy-reject forever.
                 self._is_processing[channel_key] = False
 
         try:
             async with self._get_channel_lock(channel_key):
-                state = self._sessions[channel_key]
+                state = self._sessions.get(channel_key)
+                if state is None:
+                    # Session was killed between the caller's check and our
+                    # lock acquisition — KeyError here used to crash the
+                    # stream with no user-visible message.
+                    logger.warning("TUI_IO: send_stream with no session channel=%s", channel_key)
+                    ret = on_event(StreamEvent("result_message", t("ui.tmux_not_active")))
+                    if asyncio.iscoroutine(ret):
+                        await ret
+                    return ""
                 self._is_processing[channel_key] = True
                 logger.info(
                     "TUI_IO: send_stream session=%s len=%d",
@@ -2189,7 +2254,10 @@ class TmuxManager:
                 existing = self._cancel_events.get(channel_key)
                 if existing:
                     existing.set()
-                    await self._wait_for_tail_exit(channel_key, timeout=0.5)
+                    # Full 2.5s grace (same as _wait_for_tail_exit default):
+                    # the old 0.5s window often left the previous tail alive,
+                    # and two tails on one transcript duplicate every event.
+                    await self._wait_for_tail_exit(channel_key)
 
                 codex_snapshot = None
                 needs_codex_discovery = (
@@ -2264,14 +2332,30 @@ class TmuxManager:
 
         Sends Escape via `tmux send-keys` to interrupt the current CC
         operation, then unblocks the tail.
+
+        Takes the per-channel lifecycle lock so Escape never lands in the
+        middle of a prompt delivery (send_stream's locked section) or a
+        recycle/clear_context mutation.
         """
+        async with self._get_channel_lock(channel_key):
+            await self._cancel_unlocked(channel_key)
+
+    async def _cancel_unlocked(self, channel_key: ChannelKey) -> None:
+        """Cancel body. Caller must hold the per-channel lifecycle lock."""
         state = self._sessions.get(channel_key)
         if state:
             logger.info("TUI_IO: cancel session=%s", state.session_name)
-            subprocess.run(
-                ["tmux", "send-keys", "-t", f"={state.session_name}:", "Escape"],
-                capture_output=True,
-            )
+            try:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["tmux", "send-keys", "-t", f"={state.session_name}:", "Escape"],
+                    capture_output=True,
+                    timeout=_TMUX_CMD_TIMEOUT_SEC,
+                )
+            except subprocess.SubprocessError:
+                # Escape undelivered — still close the buffer and unblock the
+                # tail below, otherwise the channel stays stuck in processing.
+                logger.warning("TUI_IO: cancel Escape failed for session=%s", state.session_name)
 
         # Close buffer BEFORE signalling cancel: once the tail sees the event
         # it may return from _tail_until_done and leave the buffer's worker
@@ -2754,7 +2838,18 @@ class TmuxManager:
                 self._save_state()
                 raise
             transcript = self._transcript_path_for_state(candidate)
-            candidate.offset = self._file_size(transcript) if transcript else 0
+            old_transcript = self._transcript_path_for_state(original)
+            if not (
+                transcript
+                and transcript == old_transcript
+                and candidate.session_id == original.session_id
+            ):
+                # Fresh session / new transcript — start from current EOF.
+                # When the SAME transcript is resumed, keep the old offset
+                # (already copied by replace): output written between the
+                # tail cancel above and the restart would otherwise be
+                # silently dropped; the recovery tail delivers it instead.
+                candidate.offset = self._file_size(transcript) if transcript else 0
             self._commit_state(state, candidate)
             self._sessions[channel_key] = state
             self._save_state()
@@ -2764,8 +2859,9 @@ class TmuxManager:
             return True
 
     async def _kill_session_unlocked(self, channel_key: ChannelKey) -> None:
-        # Cancel tail loop first so send_stream unblocks.
-        await self.cancel(channel_key)
+        # Cancel tail loop first so send_stream unblocks. Unlocked variant —
+        # kill() already holds the lifecycle lock.
+        await self._cancel_unlocked(channel_key)
 
         state = self._sessions.pop(channel_key, None)
         if state:

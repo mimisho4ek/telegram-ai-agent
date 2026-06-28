@@ -42,6 +42,10 @@ Bot MCP send tools support optional Telegram `parse_mode` values `HTML` and
 `MarkdownV2`. Runtime code retries without formatting when Telegram rejects
 formatting and a retry is safe.
 
+Rich final-answer rendering requires an aiogram version with Telegram rich
+message support and `markdown-it-py` for Markdown table parsing. The public
+dependency floor is `aiogram>=3.29` and `markdown-it-py>=4.2.0`.
+
 Runtime prefers Claude Code when both engines are available. If a topic is
 configured for a missing engine and the other CLI is installed, the bot switches
 the topic to the available engine, persists that change, resets the active

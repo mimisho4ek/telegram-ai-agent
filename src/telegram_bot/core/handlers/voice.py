@@ -19,6 +19,7 @@ from telegram_bot.core.handlers.streaming import (
 from telegram_bot.core.messages import t
 from telegram_bot.core.services.claude import SessionManager
 from telegram_bot.core.services.message_queue import MessageQueue
+from telegram_bot.core.services.telegram_utils import send_placeholder
 from telegram_bot.core.services.tmux_manager import TmuxManager
 from telegram_bot.core.services.topic_config import TopicConfig
 from telegram_bot.core.services.transcriber import Transcriber
@@ -53,10 +54,14 @@ async def handle_voice(
         return
 
     # Show recognizing status immediately; ForwardBatcher._process_batch will edit it
-    # with the transcript once transcription completes.
-    recognizing_msg = await message.answer(t("ui.recognizing_voice"))
+    # with the transcript once transcription completes. A flood-walled placeholder
+    # must not drop the voice message itself, so failures degrade to None.
+    recognizing_msg = await send_placeholder(
+        lambda: message.answer(t("ui.recognizing_voice")),
+        label="recognizing placeholder",
+    )
 
-    async def on_voice_batch(voice_snapshot: list[tuple[Message, Message]]) -> None:
+    async def on_voice_batch(voice_snapshot: list[tuple[Message, Message | None]]) -> None:
         """Handle voice-only batch after transcription has completed.
 
         By the time this runs, forward_batcher._process_batch has already transcribed

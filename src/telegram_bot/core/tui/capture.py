@@ -14,6 +14,7 @@ Enter, polls for another 5s, then kills the session and returns False.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import logging
 import re
@@ -68,12 +69,18 @@ def escape_pane_for_html(pane_text: str) -> str:
     return _C0_STRIP_RE.sub("", escaped)
 
 
+# Same rationale as send_keys._TMUX_CMD_TIMEOUT_SEC: a hung tmux server must
+# not block callers (often holding the per-channel lifecycle lock) forever.
+_TMUX_CMD_TIMEOUT_SEC = 10.0
+
+
 def _capture_pane(session_name: str) -> str:
     result = subprocess.run(
         ["tmux", "capture-pane", "-t", f"={session_name}:", "-p", "-S", "-200"],
         check=True,
         capture_output=True,
         text=True,
+        timeout=_TMUX_CMD_TIMEOUT_SEC,
     )
     return result.stdout
 
@@ -82,6 +89,7 @@ def _send_enter(session_name: str) -> None:
     subprocess.run(
         ["tmux", "send-keys", "-t", f"={session_name}:", "Enter"],
         check=True,
+        timeout=_TMUX_CMD_TIMEOUT_SEC,
     )
 
 
@@ -89,6 +97,7 @@ def _kill_session(session_name: str) -> None:
     subprocess.run(
         ["tmux", "kill-session", "-t", f"={session_name}"],
         check=False,
+        timeout=_TMUX_CMD_TIMEOUT_SEC,
     )
 
 
@@ -122,11 +131,14 @@ async def await_prompt_ready(
     while clock() < deadline:
         try:
             pane = await asyncio.to_thread(_capture_pane, session_name)
-        except subprocess.CalledProcessError:
+        except subprocess.SubprocessError:
             return False
 
         if is_trust_dialog(pane) and not trust_handled:
-            await asyncio.to_thread(_send_enter, session_name)
+            try:
+                await asyncio.to_thread(_send_enter, session_name)
+            except subprocess.SubprocessError:
+                return False
             trust_handled = True
             await asyncio.sleep(_POLL_INTERVAL_SEC)
             continue
@@ -139,14 +151,14 @@ async def await_prompt_ready(
     # Main loop exhausted — one fallback Enter, then 5s grace window.
     try:
         await asyncio.to_thread(_send_enter, session_name)
-    except subprocess.CalledProcessError:
+    except subprocess.SubprocessError:
         return False
 
     fallback_deadline = clock() + _FALLBACK_POLL_BUDGET_SEC
     while clock() < fallback_deadline:
         try:
             pane = await asyncio.to_thread(_capture_pane, session_name)
-        except subprocess.CalledProcessError:
+        except subprocess.SubprocessError:
             return False
         if is_prompt_ready(pane):
             return True
@@ -161,5 +173,6 @@ async def await_prompt_ready(
         timeout,
         last_lines,
     )
-    await asyncio.to_thread(_kill_session, session_name)
+    with contextlib.suppress(subprocess.SubprocessError):
+        await asyncio.to_thread(_kill_session, session_name)
     return False

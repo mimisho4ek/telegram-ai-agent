@@ -7,11 +7,14 @@ BOT_TOKEN must be set in environment (read from .env by start.sh).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import time
 from contextlib import ExitStack
 from pathlib import Path
+from typing import Any
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -39,6 +42,40 @@ _PHOTO_FALLBACK_ERRORS = (
     "failed to get http url content",
 )
 _VALID_PARSE_MODES = {"html": "HTML", "markdownv2": "MarkdownV2"}
+# Flood-wait ceiling: longer waits mean the chat is being hammered — better to
+# surface the 429 to the agent than block the MCP tool call for minutes.
+_MAX_RETRY_AFTER_SEC = 30
+
+
+def _retry_after_seconds(resp: httpx.Response) -> int | None:
+    try:
+        return int(resp.json()["parameters"]["retry_after"])
+    except Exception:
+        return None
+
+
+def _post_with_flood_retry(
+    client: httpx.Client,
+    url: str,
+    data: dict[str, str],
+    files: dict[str, Any] | None = None,
+) -> httpx.Response:
+    """POST to Telegram; on 429 wait the advertised retry_after and retry once."""
+    resp = client.post(url, data=data, files=files) if files else client.post(url, data=data)
+    if resp.status_code != 429:
+        return resp
+    retry_after = _retry_after_seconds(resp)
+    if retry_after is None or retry_after > _MAX_RETRY_AFTER_SEC:
+        return resp
+    logger.warning("Telegram flood wait %ss on %s — retrying once", retry_after, url.split("/")[-1])
+    time.sleep(retry_after)
+    if files:
+        # httpx consumed the file objects on the first attempt — rewind them.
+        for value in files.values():
+            fileobj = value[1] if isinstance(value, tuple) else value
+            with contextlib.suppress(Exception):
+                fileobj.seek(0)
+    return client.post(url, data=data, files=files) if files else client.post(url, data=data)
 
 
 def _env_int(name: str) -> tuple[int | None, str | None]:
@@ -155,7 +192,7 @@ def _post_message(
                     data["message_thread_id"] = str(thread_id)
                 if parse_mode is not None:
                     data["parse_mode"] = parse_mode
-                resp = client.post(url, data=data)
+                resp = _post_with_flood_retry(client, url, data)
                 if resp.status_code == 200:
                     continue
                 error = _extract_error(resp)
@@ -163,7 +200,7 @@ def _post_message(
                 # (those propagate up so send_image's photo-fallback can act).
                 if parse_mode is not None and not _is_photo_marker_error(error):
                     retry_data = {k: v for k, v in data.items() if k != "parse_mode"}
-                    retry_resp = client.post(url, data=retry_data)
+                    retry_resp = _post_with_flood_retry(client, url, retry_data)
                     if retry_resp.status_code == 200:
                         logger.warning(
                             "parse_mode dropped (parse_mode=%s, error=%s)",
@@ -223,7 +260,9 @@ def _send_to_telegram(
     success_full = f"{success_label}: {file_path.name}"
     try:
         with httpx.Client(timeout=60) as client, open(file_path, "rb") as f:
-            resp = client.post(url, data=data, files={file_field: (file_path.name, f)})
+            resp = _post_with_flood_retry(
+                client, url, data, files={file_field: (file_path.name, f)}
+            )
         if resp.status_code == 200:
             result = success_full
             if caption_tail:
@@ -234,8 +273,8 @@ def _send_to_telegram(
         if parse_mode is not None and not _is_photo_marker_error(error):
             retry_data = {k: v for k, v in data.items() if k != "parse_mode"}
             with httpx.Client(timeout=60) as client, open(file_path, "rb") as f:
-                retry_resp = client.post(
-                    url, data=retry_data, files={file_field: (file_path.name, f)}
+                retry_resp = _post_with_flood_retry(
+                    client, url, retry_data, files={file_field: (file_path.name, f)}
                 )
             if retry_resp.status_code == 200:
                 logger.warning(
@@ -298,7 +337,12 @@ def _send_image_path(
     thread_id: int | None = None,
     parse_mode: str | None = None,
 ) -> str:
-    size = file_path.stat().st_size
+    # File can vanish between _resolve_file_path and here (temp screenshots) —
+    # an unhandled OSError would surface as a raw MCP tool exception.
+    try:
+        size = file_path.stat().st_size
+    except OSError as exc:
+        return f"Ошибка: {exc}"
     is_image = file_path.suffix.lower() in _IMAGE_EXTENSIONS and size <= _MAX_PHOTO_SIZE
     if not is_image:
         return _send_document(token, chat_id, file_path, caption, thread_id, parse_mode)
@@ -347,7 +391,7 @@ def _post_media_group(
             for idx, file_path in enumerate(file_paths)
         }
         with httpx.Client(timeout=60) as client:
-            return client.post(url, data=data, files=files)
+            return _post_with_flood_retry(client, url, data, files=files)
 
 
 def _send_image_gallery(

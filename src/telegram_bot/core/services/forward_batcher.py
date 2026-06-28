@@ -38,6 +38,11 @@ from telegram_bot.core.handlers.photo import (
     is_file_too_large,
 )
 from telegram_bot.core.messages import t
+from telegram_bot.core.services.rich_content import (
+    RichContentAttachment,
+    normalize_telegram_content,
+    normalize_telegram_text_content,
+)
 from telegram_bot.core.services.transcriber import Transcriber, TranscriptionError
 from telegram_bot.core.types import ChannelKey
 from telegram_bot.core.utils.fs import sanitize_filename
@@ -270,6 +275,71 @@ async def _download_document(
         return None
 
 
+async def _download_rich_photo_attachment(
+    attachment: RichContentAttachment,
+    *,
+    bot: Bot,
+    tmp_dir: Path,
+    message_id: int,
+) -> str | None:
+    """Download a rich-message photo attachment for the main assistant prompt."""
+    try:
+        if is_file_too_large(attachment.file_size):
+            logger.warning(
+                "Forwarded rich photo too large: message_id=%s block=%s size=%s",
+                message_id,
+                attachment.block_position,
+                attachment.file_size,
+            )
+            return None
+        timestamp = int(time.time())
+        unique = sanitize_filename(attachment.file_unique_id or attachment.file_id)
+        dest_path = tmp_dir / f"{timestamp}_{unique}.jpg"
+        await bot.download(attachment.file_id, destination=dest_path)
+        return str(dest_path)
+    except Exception:
+        logger.warning(
+            "Failed to download forwarded rich photo (message_id=%s, block=%s)",
+            message_id,
+            attachment.block_position,
+            exc_info=True,
+        )
+        return None
+
+
+async def _download_rich_photo_attachments(
+    attachments: list[RichContentAttachment],
+    *,
+    bot: Bot,
+    tmp_dir: Path,
+    message_id: int,
+) -> dict[int, str]:
+    paths: dict[int, str] = {}
+    for attachment in attachments:
+        path = await _download_rich_photo_attachment(
+            attachment,
+            bot=bot,
+            tmp_dir=tmp_dir,
+            message_id=message_id,
+        )
+        if path is not None:
+            paths[attachment.block_position] = path
+    return paths
+
+
+def _insert_rich_attachment_paths(text: str, paths_by_position: dict[int, str]) -> str:
+    result = text
+    for position, path in sorted(paths_by_position.items()):
+        placeholder = f"[rich block {position}: photo]"
+        file_line = t("cc.file_path", path=path)
+        replacement = f"{placeholder}\n{file_line}"
+        if placeholder in result:
+            result = result.replace(placeholder, replacement, 1)
+        else:
+            result = f"{result}\n{file_line}" if result else file_line
+    return result
+
+
 async def _process_forwarded_message(
     message: Message,
     bot: Bot,
@@ -299,8 +369,28 @@ async def _process_forwarded_message(
     )
 
     # Text-only message — simple case
-    if message.text:
-        text = unparse_entities(message.text, message.entities)
+    has_media = any(
+        (
+            message.voice,
+            message.photo,
+            message.document,
+            message.video,
+            message.sticker,
+            message.video_note,
+            message.audio,
+        )
+    )
+    if not has_media and (message.text or getattr(message, "rich_message", None)):
+        normalized = await normalize_telegram_content(message, bot=bot, transcriber=transcriber)
+        text = normalized.text
+        if normalized.attachments:
+            paths_by_position = await _download_rich_photo_attachments(
+                normalized.attachments,
+                bot=bot,
+                tmp_dir=_get_tmp_dir(file_cache_dir),
+                message_id=message.message_id,
+            )
+            text = _insert_rich_attachment_paths(text, paths_by_position)
         return ForwardedMessage(sender=sender, date=date, text=text)
 
     parts: list[str] = []
@@ -341,9 +431,10 @@ async def _process_forwarded_message(
     if message.audio:
         parts.append(t("cc.audio", title=message.audio.title or t("cc.audio_untitled")))
 
-    # Caption
-    if message.caption:
-        parts.append(unparse_entities(message.caption, message.caption_entities))
+    # Caption / rich media body
+    caption_text = normalize_telegram_text_content(message).text
+    if caption_text:
+        parts.append(caption_text)
 
     text = " ".join(parts) if parts else t("cc.empty_message")
     return ForwardedMessage(
@@ -414,11 +505,12 @@ class ChatBatch:
     buffer: list[Message] = field(default_factory=list)
     media_buffer: list[Message] = field(default_factory=list)
     # Pairs of (voice_message, recognizing_status_message). Paired so _process_batch
-    # can edit the status message with the transcript result.
-    voice_buffer: list[tuple[Message, Message]] = field(default_factory=list)
+    # can edit the status message with the transcript result. The status message is
+    # None when its send was flood-walled — transcription still proceeds.
+    voice_buffer: list[tuple[Message, Message | None]] = field(default_factory=list)
     # Snapshot of voice_buffer taken at the start of _process_batch, kept on the
     # batch so voice callbacks can read it via the batch reference.
-    voice_snapshot: list[tuple[Message, Message]] = field(default_factory=list)
+    voice_snapshot: list[tuple[Message, Message | None]] = field(default_factory=list)
     timer: asyncio.Task[None] | None = None
     processing_task: asyncio.Task[None] | None = None
     last_message: Message | None = None
@@ -431,7 +523,7 @@ class ChatBatch:
     forward_callback: Callable[[list[Message]], Awaitable[None]] | None = None
     text_callback: Callable[[str, Message], Awaitable[None]] | None = None
     media_callback: Callable[[list[Message]], Awaitable[None]] | None = None
-    voice_callback: Callable[[list[tuple[Message, Message]]], Awaitable[None]] | None = None
+    voice_callback: Callable[[list[tuple[Message, Message | None]]], Awaitable[None]] | None = None
 
 
 class ForwardBatcher:
@@ -484,8 +576,8 @@ class ForwardBatcher:
         self,
         channel_key: ChannelKey,
         msg: Message,
-        recognizing_msg: Message,
-        on_voice_batch: Callable[[list[tuple[Message, Message]]], Awaitable[None]],
+        recognizing_msg: Message | None,
+        on_voice_batch: Callable[[list[tuple[Message, Message | None]]], Awaitable[None]],
     ) -> None:
         """Add a voice message to the voice buffer and reset debounce timer.
 
@@ -554,12 +646,16 @@ class ForwardBatcher:
                 else 0
             )
             if buf_len >= self._max_batch_size:
-                collected = self._collect(channel_key)
+                # Flush through the serialized _debounce path (zero wait).
+                # The previous inline collect+create_task here spun up a
+                # second _process_batch in parallel with any in-flight one
+                # (the exact shared-state race _debounce serialization
+                # exists to prevent) and overwrote batch.processing_task —
+                # the old task's finally then nulled the NEW task's only
+                # strong reference (GC risk, broken serialization).
+                timer = asyncio.create_task(self._debounce(channel_key, 0.0))
                 if channel_key in self._batches:
-                    self._batches[channel_key].timer = None
-                    self._batches[channel_key].processing_task = asyncio.create_task(
-                        self._run_processing(channel_key, collected),
-                    )
+                    self._batches[channel_key].timer = timer
                 return
 
             # Text waiting for forwards/media/voice — use longer debounce so Telegram
@@ -712,7 +808,8 @@ class ForwardBatcher:
             )
             for (_, recog_msg), (success, text) in zip(voice_snapshot, results, strict=True):
                 ui_text = f"\U0001f3a4 {text}" if success else text
-                await _edit_recog_msg(recog_msg, ui_text)
+                if recog_msg is not None:
+                    await _edit_recog_msg(recog_msg, ui_text)
                 if success:
                     cb.comment.append(f"{t('cc.voice_transcript_short')} {text}")
 
@@ -791,7 +888,10 @@ class ForwardBatcher:
         # cold-start. A blanket `cb.comment.clear()` here would drop them.
         del cb.comment[:comment_snapshot_size]
         del cb.message_ids[:msg_ids_snapshot_size]
-        cb.media_buffer.clear()
+        # Same snapshot-prefix semantics as comment above: media that arrived
+        # via add_media during the callback awaits stays for the next batch.
+        # A blanket .clear() here silently dropped it.
+        del cb.media_buffer[: len(media)]
         cb.voice_snapshot = []
 
     def _cleanup(self, channel_key: ChannelKey) -> None:

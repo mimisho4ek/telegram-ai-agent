@@ -31,6 +31,8 @@ tokens, or machine-specific deployment config.
   health with `/mcpstatus`.
 - Let the agent send messages, images, image galleries, and documents back to
   Telegram through the bundled bot MCP server.
+- Render final answers that contain Markdown tables as Telegram rich messages,
+  with automatic fallback to plain Telegram text.
 
 ## How It Works
 
@@ -42,6 +44,18 @@ only the control surface. When you send a message, the bot:
 3. resolves the current chat or forum topic settings;
 4. sends the prompt to Claude Code or Codex in the configured working directory;
 5. streams progress and the final answer back to Telegram.
+
+## Rich Final Answers
+
+Intermediate progress messages are always plain Telegram messages. When the
+agent's final answer contains a Markdown table, the bot converts that answer to
+Telegram rich message blocks and sends it with Telegram's RichText/RichMessage
+API. Final answers without tables stay plain. If Telegram rejects the rich
+payload or the installed Telegram library cannot send it, the bot falls back to
+the normal text response.
+
+Telegram's public schema for this feature starts at
+https://core.telegram.org/type/RichText.
 
 Forum topics are isolated by Telegram `chat_id` and `thread_id`. Each topic can
 have its own:

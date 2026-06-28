@@ -203,6 +203,12 @@ def sanitize_html(text: str) -> str:
 _BALANCE_TAG_RE = re.compile(r"<(/?)([a-z]+)(?:\s+[^>]*)?>", re.IGNORECASE)
 _BALANCE_TAGS = frozenset({"b", "i", "u", "s", "code", "pre", "a"})
 
+# _balance_html_tags can prepend openers / append closers to a chunk after the
+# split. Splitting at the raw Telegram limit then yields >4096-char chunks and
+# the send fails with TelegramBadRequest. 64 chars covers any realistic
+# nesting depth of the seven allowed tags.
+_BALANCE_MARGIN = 64
+
 
 def _balance_html_tags(chunk: str) -> str:
     """Ensure every Telegram-subset tag in *chunk* is balanced.
@@ -300,7 +306,13 @@ def split_html_message(text: str, limit: int = _TG_MSG_LIMIT) -> list[str]:
     formatted = sanitized
 
     if len(formatted) <= limit:
-        return [_balance_html_tags(formatted)]
+        balanced = _balance_html_tags(formatted)
+        if len(balanced) <= limit:
+            return [balanced]
+        # Balancing pushed the single chunk over the limit — fall through
+        # to the split path, which reserves headroom for the added tags.
+
+    split_limit = max(limit - _BALANCE_MARGIN, 1)
 
     result: list[str] = []
     current: list[str] = []
@@ -310,17 +322,17 @@ def split_html_message(text: str, limit: int = _TG_MSG_LIMIT) -> list[str]:
         line_len = len(line)
         sep = 1 if current else 0  # "\n" separator between lines
 
-        if current_len + sep + line_len > limit:
+        if current_len + sep + line_len > split_limit:
             if current:
                 result.append("\n".join(current))
                 current, current_len = [], 0
 
-            if line_len > limit:
+            if line_len > split_limit:
                 # Single line exceeds limit — fall back to character split.
                 # This may still break a tag, but only for pathologically long
                 # lines without newlines, which are rare in practice.
-                for i in range(0, line_len, limit):
-                    result.append(line[i : i + limit])
+                for i in range(0, line_len, split_limit):
+                    result.append(line[i : i + split_limit])
             else:
                 current = [line]
                 current_len = line_len
@@ -334,5 +346,5 @@ def split_html_message(text: str, limit: int = _TG_MSG_LIMIT) -> list[str]:
     # Fallback: only reachable if formatted is non-empty but every line is empty
     # (e.g. text == "\n" * N), which produces an empty result list. Guard against
     # returning [] so callers always get at least one chunk.
-    chunks = result or [formatted[:limit]]
+    chunks = result or [formatted[:split_limit]]
     return [_balance_html_tags(c) for c in chunks]

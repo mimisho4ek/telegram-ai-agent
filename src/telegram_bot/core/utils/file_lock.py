@@ -28,13 +28,21 @@ class FileLock:
             Path("/path/to/data.json").write_text(json.dumps(data))
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, blocking: bool = True) -> None:
         self._lock_path = Path(path).with_suffix(Path(path).suffix + ".lock")
         self._fd: TextIOWrapper | None = None
+        self._blocking = blocking
 
     def __enter__(self) -> FileLock:
         self._fd = open(self._lock_path, "w")
-        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        flags = fcntl.LOCK_EX if self._blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        try:
+            fcntl.flock(self._fd, flags)
+        except BlockingIOError:
+            # Non-blocking acquire failed: another process holds the lock.
+            self._fd.close()
+            self._fd = None
+            raise
         return self
 
     def __exit__(
@@ -47,7 +55,10 @@ class FileLock:
             fcntl.flock(self._fd, fcntl.LOCK_UN)
             self._fd.close()
             self._fd = None
-            self._lock_path.unlink(missing_ok=True)
+            # Lock file is intentionally NOT unlinked: removing it while
+            # another process already open()'d the same path lets a third
+            # process create a fresh inode and flock it concurrently —
+            # two holders of "the same" lock (stale-inode race).
 
 
 class AsyncFileLock:
@@ -88,7 +99,7 @@ class AsyncFileLock:
             fcntl.flock(self._fd, fcntl.LOCK_UN)
             self._fd.close()
             self._fd = None
-            self._lock_path.unlink(missing_ok=True)
+            # No unlink — see FileLock.__exit__ (stale-inode race).
 
     async def __aenter__(self) -> AsyncFileLock:
         loop = asyncio.get_running_loop()
@@ -101,5 +112,8 @@ class AsyncFileLock:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._get_executor(), self._release)
+        # Release runs inline: LOCK_UN and close() never block, and routing it
+        # through the 4-worker pool can deadlock — four tasks blocked in
+        # _acquire fill every worker, the holder's release queues behind them,
+        # and nobody ever gets the lock.
+        self._release()

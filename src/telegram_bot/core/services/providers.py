@@ -292,6 +292,11 @@ class CodexAdapter:
                 matches += 1
         return matches
 
+    def has_prompt_user_message_after(self, path: Path, *, offset: int, prompt: str) -> bool:
+        """True when a Codex TUI transcript records this prompt after offset."""
+        records = self._iter_complete_json_lines_from(path, offset)
+        return self._has_prompt_user_message(records, prompt) > 0
+
     @staticmethod
     def _command_from_exec_payload(payload: dict[str, Any]) -> str | None:
         command = payload.get("command")

@@ -17,7 +17,10 @@ lru_cache around _get_lang() keeps a single value for the process lifetime.
 from __future__ import annotations
 
 import functools
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_LANG = "en"
 
@@ -229,6 +232,13 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.queue_added_batch": "Added to batch, #{position} in queue",
         "ui.queue_added": "Added to queue (#{position})",
         "ui.queue_session_suffix": ", session: {sid}",
+        "ui.queue_item_dropped": (
+            "⚠️ Message processing failed — it was not delivered to the agent. Please resend."
+        ),
+        "ui.queue_dropped_shutdown": (
+            "⚠️ Bot is restarting — your queued message was not processed. "
+            "Please resend it after the restart."
+        ),
         # --- Tool status (shown while CC runs a tool) -----------------
         "tool.read": "📖 Reading file",
         "tool.grep": "🔍 Searching",
@@ -410,6 +420,13 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.queue_added_batch": "Добавлено в батч, он №{position} в очереди",
         "ui.queue_added": "Добавлено в очередь (№{position})",
         "ui.queue_session_suffix": ", сессия: {sid}",
+        "ui.queue_item_dropped": (
+            "⚠️ Не удалось обработать сообщение — оно не дошло до агента. Отправь ещё раз."
+        ),
+        "ui.queue_dropped_shutdown": (
+            "⚠️ Бот перезапускается — сообщение из очереди не обработано. "
+            "Отправь его ещё раз после рестарта."
+        ),
         # --- Tool status ----------------------------------------------
         "tool.read": "📖 Читаю файл",
         "tool.grep": "🔍 Ищу",
@@ -466,7 +483,14 @@ def t(key: str, **kwargs: Any) -> str:
     if template is None:
         template = MESSAGES[_DEFAULT_LANG].get(key, key)
     if kwargs:
-        return template.format(**kwargs)
+        # t() is used on error paths — a template/kwargs mismatch (stray
+        # brace, renamed placeholder) must degrade to the raw template, not
+        # raise and mask the original error.
+        try:
+            return template.format(**kwargs)
+        except (KeyError, IndexError, ValueError):
+            logger.warning("t(%s): format failed with kwargs %s", key, sorted(kwargs))
+            return template
     return template
 
 

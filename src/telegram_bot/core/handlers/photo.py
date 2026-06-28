@@ -22,6 +22,7 @@ from telegram_bot.core.handlers.streaming import (
 from telegram_bot.core.messages import t
 from telegram_bot.core.services.claude import SessionManager
 from telegram_bot.core.services.message_queue import MessageQueue
+from telegram_bot.core.services.rich_content import normalize_telegram_text_content
 from telegram_bot.core.services.tmux_manager import TmuxManager
 from telegram_bot.core.services.topic_config import TopicConfig
 from telegram_bot.core.types import ChannelKey, channel_key
@@ -107,6 +108,7 @@ async def _download_and_format_media(
     Returns dict with 'path': None on download failure.
     """
     if message.photo:
+        caption = normalize_telegram_text_content(message).text
         photo = message.photo[-1]
         timestamp = int(time.time())
         filename = f"{timestamp}_{photo.file_unique_id}.jpg"
@@ -115,14 +117,14 @@ async def _download_and_format_media(
             await bot.download(photo.file_id, destination=dest_path)
             return {
                 "type": "photo",
-                "caption": message.caption or "",
+                "caption": caption,
                 "path": str(dest_path),
             }
         except Exception:
             logger.warning("Failed to download photo in media batch", exc_info=True)
             return {
                 "type": "photo",
-                "caption": message.caption or "",
+                "caption": caption,
                 "path": None,
                 "error": "failed to download photo",
             }
@@ -133,7 +135,7 @@ async def _download_and_format_media(
         original_name = sanitize_filename(doc.file_name or "file")
         dest_filename = f"{timestamp}_{doc.file_unique_id}_{original_name}"
         dest_path = tmp_dir / dest_filename
-        caption = message.caption or ""
+        caption = normalize_telegram_text_content(message).text
         try:
             await bot.download(doc.file_id, destination=dest_path)
             return {
