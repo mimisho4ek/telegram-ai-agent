@@ -22,8 +22,8 @@ CLI на вашем VPS. Он превращает Telegram в удаленны�
 - Выбирать Claude Code или Codex отдельно для каждого топика.
 - Использовать постоянную `tmux`-сессию для полноценной разработки или короткий
   subprocess для простых разовых задач.
-- Отправлять текст, фото, документы, пачки forwarded messages и, опционально,
-  voice messages.
+- Отправлять текст, фото, документы, пачки forwarded messages, Telegram rich
+  messages и, опционально, voice messages.
 - Делать свои prompt modes под разные сценарии.
 - Открывать live TUI snapshot через `/tui` и нажимать кнопки Enter, Esc,
   стрелки, цифры, refresh и close.
@@ -47,6 +47,12 @@ Telegram - только интерфейс управления. Когда вы
 5. стримит прогресс и финальный ответ обратно в Telegram.
 
 ## Rich Final Answers
+
+Бот умеет читать входящие Telegram rich messages, включая forwarded rich posts.
+Текстовые блоки нормализуются в Markdown-like текст для агента, таблицы и
+сноски остаются видимыми в этом тексте, а rich photo blocks передаются как
+image attachments, если Telegram отдает по ним файлы. Rich media без доступных
+файлов остается явными placeholders.
 
 Промежуточные сообщения всегда отправляются обычными Telegram-сообщениями. Если
 в финальном ответе агента есть Markdown-таблица, бот преобразует этот ответ в

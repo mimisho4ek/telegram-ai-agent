@@ -21,8 +21,8 @@ tokens, or machine-specific deployment config.
 - Choose Claude Code or Codex per topic.
 - Use a persistent `tmux` session for real development work, or a short-lived
   subprocess for simple one-off tasks.
-- Send text, photos, documents, forwarded message batches, and optional voice
-  messages.
+- Send text, photos, documents, forwarded message batches, Telegram rich
+  messages, and optional voice messages.
 - Use custom prompt modes for different workflows.
 - Open a live TUI snapshot with `/tui` and press buttons for Enter, Esc, arrows,
   digits, refresh, and close.
@@ -46,6 +46,12 @@ only the control surface. When you send a message, the bot:
 5. streams progress and the final answer back to Telegram.
 
 ## Rich Final Answers
+
+The bot can read incoming Telegram rich messages, including forwarded rich
+posts. Text blocks are normalized into Markdown-like text for the agent, tables
+and footnotes stay visible in that text, and rich photo blocks are exposed as
+image attachments when Telegram provides files for them. Non-text rich media
+without accessible files is kept as explicit placeholders.
 
 Intermediate progress messages are always plain Telegram messages. When the
 agent's final answer contains a Markdown table, the bot converts that answer to
