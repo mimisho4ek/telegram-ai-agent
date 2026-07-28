@@ -43,10 +43,22 @@ _VALID_ACTIONS = frozenset(
         "cO",
         "cR",
         "cT",
+        "cB",
         "num1",
         "num2",
         "num3",
+        "num4",
+        "num5",
         "num0",
+        "num1e",
+        "num2e",
+        "num3e",
+        "num4e",
+        "num5e",
+        "keyD",
+        "keyY",
+        "keyN",
+        "spc",
         "refresh",
         "close",
     }
@@ -91,11 +103,13 @@ def build_tail_keyboard(
 ) -> InlineKeyboardMarkup:
     """Build the /tui inline keyboard.
 
-    Layout (4 rows):
+    Layout (6 rows):
       row 1 (arrows):     ⬆️  ⬇️  ⬅️  ➡️
       row 2 (input/esc):  ↩️  ⌫  Esc  Esc 2  Tab  ⇧Tab
-      row 3 (digits):     1  2  3  0
-      row 4 (CC ctrl):    ⌃C  ⌃U  ⌃O  ⌃R  ⌃T  🔄  Close
+      row 3 (digits):     1  2  3  4  5  0
+      row 4 (submit):     1↵  2↵  3↵  4↵  5↵
+      row 5 (letters):    d  y  n  Space
+      row 6 (CC ctrl):    ⌃C  ⌃U  ⌃O  ⌃R  ⌃T  ⌃B  🔄  Close
 
     `kind` tags the message this keyboard belongs to (`panel` or `modal`)
     so the re-render path can pick the correct layout. Modal-alert callers
@@ -128,7 +142,24 @@ def build_tail_keyboard(
         InlineKeyboardButton(text="1", callback_data=cb("num1")),
         InlineKeyboardButton(text="2", callback_data=cb("num2")),
         InlineKeyboardButton(text="3", callback_data=cb("num3")),
+        InlineKeyboardButton(text="4", callback_data=cb("num4")),
+        InlineKeyboardButton(text="5", callback_data=cb("num5")),
         InlineKeyboardButton(text="0", callback_data=cb("num0")),
+    ]
+
+    submit_digit_row = [
+        InlineKeyboardButton(text="1↵", callback_data=cb("num1e")),
+        InlineKeyboardButton(text="2↵", callback_data=cb("num2e")),
+        InlineKeyboardButton(text="3↵", callback_data=cb("num3e")),
+        InlineKeyboardButton(text="4↵", callback_data=cb("num4e")),
+        InlineKeyboardButton(text="5↵", callback_data=cb("num5e")),
+    ]
+
+    letter_row = [
+        InlineKeyboardButton(text="d", callback_data=cb("keyD")),
+        InlineKeyboardButton(text="y", callback_data=cb("keyY")),
+        InlineKeyboardButton(text="n", callback_data=cb("keyN")),
+        InlineKeyboardButton(text="Space", callback_data=cb("spc")),
     ]
 
     control_row = [
@@ -137,11 +168,21 @@ def build_tail_keyboard(
         InlineKeyboardButton(text="⌃O", callback_data=cb("cO")),
         InlineKeyboardButton(text="⌃R", callback_data=cb("cR")),
         InlineKeyboardButton(text="⌃T", callback_data=cb("cT")),
+        InlineKeyboardButton(text="⌃B", callback_data=cb("cB")),
         InlineKeyboardButton(text="🔄", callback_data=cb("refresh")),
         InlineKeyboardButton(text="Close", callback_data=cb("close")),
     ]
 
-    return InlineKeyboardMarkup(inline_keyboard=[arrow_row, input_row, digit_row, control_row])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            arrow_row,
+            input_row,
+            digit_row,
+            submit_digit_row,
+            letter_row,
+            control_row,
+        ]
+    )
 
 
 def parse_tail_callback(data: str) -> TailCallback | None:

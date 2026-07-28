@@ -20,7 +20,9 @@ from telegram_bot.core.handlers.forward import router as forward_router
 from telegram_bot.core.handlers.mode import router as mode_router
 from telegram_bot.core.handlers.photo import cleanup_old_tmp_files, ensure_tmp_dir
 from telegram_bot.core.handlers.photo import router as photo_router
+from telegram_bot.core.handlers.recovery import make_recovery_on_event
 from telegram_bot.core.handlers.streaming import send_streaming_response
+from telegram_bot.core.handlers.tail import router as tail_router
 from telegram_bot.core.handlers.text import router as text_router
 from telegram_bot.core.handlers.voice import router as voice_router
 from telegram_bot.core.keyboards import topic_keyboard
@@ -28,13 +30,27 @@ from telegram_bot.core.messages import t
 from telegram_bot.core.middleware.auth import AuthMiddleware
 from telegram_bot.core.services.bot_commands import setup_bot_commands
 from telegram_bot.core.services.claude import SessionManager
+from telegram_bot.core.services.codex_update import CodexUpdateService
 from telegram_bot.core.services.message_queue import MessageQueue
+from telegram_bot.core.services.picker_store import PickerStore
 from telegram_bot.core.services.tmux_manager import TmuxManager
 from telegram_bot.core.services.topic_config import TopicConfig
+from telegram_bot.core.services.topic_runtime import BotDefaults
 from telegram_bot.core.services.transcriber import Transcriber
 from telegram_bot.core.types import ChannelKey
 
 logger = logging.getLogger(__name__)
+
+
+async def _stop_polling_when_started(dispatcher: Dispatcher) -> None:
+    """Stop polling even when the signal arrives during startup."""
+    for _ in range(600):
+        try:
+            await dispatcher.stop_polling()
+            return
+        except RuntimeError:
+            await asyncio.sleep(0.1)
+    logger.error("Polling did not start within 60 seconds after a stop signal")
 
 
 async def process_queue_item(
@@ -101,11 +117,23 @@ async def _start() -> None:
     tmux_manager = TmuxManager(
         sessions_dir=Path(settings.project_root) / settings.tmux_sessions_dir,
     )
+    codex_update_service = CodexUpdateService(
+        state_path=Path(settings.project_root) / settings.tmux_sessions_dir / "codex_update.json",
+        timeout_sec=settings.codex_update_timeout_sec,
+        cooldown_sec=settings.codex_update_cooldown_sec,
+        enabled=settings.codex_auto_update_enabled,
+    )
+    tmux_manager.wire_codex_update_service(codex_update_service)
     tmux_manager.wire_live_buffer(bot=bot, topic_config=topic_config)
-    tmux_manager.restore_all()
     session_manager = SessionManager(settings, topic_config=topic_config)
+    tmux_manager.restore_all(session_manager)
+    picker_store = PickerStore()
+    bot_defaults = BotDefaults(
+        cwd=Path(settings.project_root) / settings.default_cwd,
+        mcp_config=Path(session_manager.default_mcp_config_path()),
+    )
     transcriber = Transcriber(settings)
-    forward_batcher = ForwardBatcher(bot=bot)
+    forward_batcher = ForwardBatcher(bot=bot, transcriber=transcriber)
 
     async def _process_queue_item(
         channel_key: ChannelKey,
@@ -138,6 +166,7 @@ async def _start() -> None:
     dp.include_router(forum_topic_router)
     dp.include_router(commands_router)
     dp.include_router(cancel_router)
+    dp.include_router(tail_router)
     dp.include_router(mode_router)
     dp.include_router(forward_router)
     dp.include_router(voice_router)
@@ -152,6 +181,9 @@ async def _start() -> None:
     dp["settings"] = settings
     dp["topic_config"] = topic_config
     dp["tmux_manager"] = tmux_manager
+    dp["codex_update_service"] = codex_update_service
+    dp["picker_store"] = picker_store
+    dp["bot_defaults"] = bot_defaults
 
     ensure_tmp_dir(session_manager.file_cache_dir)
     cleanup_old_tmp_files(session_manager.file_cache_dir)
@@ -176,24 +208,39 @@ async def _start() -> None:
         cleanup_task.cancel()
         await forward_batcher.shutdown()
         await message_queue.shutdown()
+        await tmux_manager.stop_transcript_watchdog()
+        await tmux_manager.stop_modal_watchdog()
         await session_manager.shutdown()
         session_manager.save_mapping()
-        tmux_manager._save_state()
+        tmux_manager.persist_state()
 
     dp.shutdown.register(_on_shutdown)
 
     loop = asyncio.get_running_loop()
-    _pending_stop: asyncio.Future[None] | None = None
+    _pending_stop: asyncio.Task[None] | None = None
 
     def _stop() -> None:
         nonlocal _pending_stop
-        _pending_stop = asyncio.ensure_future(dp.stop_polling())
+        if _pending_stop is None:
+            _pending_stop = asyncio.create_task(_stop_polling_when_started(dp))
 
     loop.add_signal_handler(signal.SIGTERM, _stop)
     loop.add_signal_handler(signal.SIGINT, _stop)
 
+    recovery_factory = make_recovery_on_event(
+        bot,
+        session_manager,
+        tmux_manager,
+        topic_config,
+    )
+    await tmux_manager.resume_tails(recovery_factory)
+    tmux_manager.start_modal_watchdog()
+    tmux_manager.start_transcript_watchdog()
+
     logger.info("Starting bot, allowed users: %d", len(settings.allowed_user_ids))
     await dp.start_polling(bot, handle_signals=False)
+    if _pending_stop is not None:
+        await _pending_stop
 
 
 def main() -> None:

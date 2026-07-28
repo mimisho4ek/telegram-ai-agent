@@ -47,10 +47,11 @@ import logging
 import re
 import subprocess
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from telegram_bot.core.messages import t
 from telegram_bot.core.services.bot_mcp_runtime import ensure_bot_runtime_mcp_config
@@ -160,11 +161,11 @@ _POLL_STEP_SEC = 0.05  # fine-grained poll interval inside send_direct's pane-ve
 _ENTER_RETRY_SETTLE_SEC = 0.5
 _ENTER_RETRY_LIMIT = 3
 
-# Codex `_safe_send_codex` paste-retry budget. Three attempts x 1.5s poll
-# each — the upper bound when codex is mid-render and the bracketed-paste
-# chip needs an extra frame to land. Beyond this we surface a modal alert
-# rather than silently looping forever.
-_CODEX_PASTE_RETRY_LIMIT = 3
+# Codex `_safe_send_codex` paste-visibility budget. The user payload is
+# pasted exactly once, then observed across three 1.5s polling windows.
+# Re-pasting an unobserved payload is unsafe: delayed bracketed-paste events
+# can drain together and duplicate the prompt in Codex's input bar.
+_CODEX_PASTE_VISIBILITY_ATTEMPT_LIMIT = 3
 _CODEX_PASTE_POLL_BUDGET_SEC = 1.5
 _CODEX_PASTE_POLL_STEP_SEC = 0.1
 
@@ -247,6 +248,8 @@ class TmuxManager:
         self._sessions: dict[ChannelKey, TmuxSessionState] = {}
         self._cancel_events: dict[ChannelKey, asyncio.Event] = {}
         self._is_processing: dict[ChannelKey, bool] = {}
+        self._processing_turns: dict[ChannelKey, set[str]] = {}
+        self._pending_processing: dict[ChannelKey, int] = {}
         # Shared spawn deadline per channel, populated by _spawn_tmux and
         # consumed by the next _tail_until_done to bound the transcript
         # poll-for-existence window inside the same 30s clock as readiness
@@ -265,23 +268,30 @@ class TmuxManager:
         # loop outlives a single user message. Typed as object to avoid a
         # circular import on LiveStatusBuffer.
         self._buffers: dict[ChannelKey, object] = {}
+        self._buffer_turn_ids: dict[ChannelKey, str | None] = {}
+        self._pending_buffers: dict[ChannelKey, deque[object]] = {}
         self._buffer_lock = asyncio.Lock()
         # Live-buffer plumbing, wired in at startup via wire_live_buffer().
         self._bot: object | None = None
         self._topic_config: object | None = None
         self._recovery_on_event_factory: (
-            Callable[[ChannelKey], Callable[[StreamEvent], Awaitable[None] | None]] | None
+            Callable[
+                [ChannelKey],
+                Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
+            ]
+            | None
         ) = None
         # Per-channel lock around send_direct's capture→send-keys→verify→Enter
         # sequence. Without it, two overlapping user messages race on shared
         # pane state.
         self._channel_locks: dict[ChannelKey, asyncio.Lock] = {}
         self._state_store = StateStore(sessions_dir / "state.json")
-        # Modal watchdog state. `_last_modal_pane` is the dedup key — the
-        # pane snapshot we last alerted on for a channel. Shared with
-        # `_send_modal_alert` so user-initiated and watchdog-initiated
-        # alerts de-duplicate against each other.
-        self._last_modal_pane: dict[ChannelKey, str] = {}
+        # Channels whose currently-open modal has already produced a Telegram
+        # alert. This is a lifecycle latch, not a pane snapshot: Codex redraws
+        # timers and typed answers while one modal stays open, so byte-level
+        # pane comparison turns harmless redraws into repeated chat messages.
+        # Both user-initiated and watchdog-initiated alerts share the latch.
+        self._modal_alerted_channels: set[ChannelKey] = set()
         # Re-resolve `_check_channel_modal` on every tick so `patch.object(
         # mgr, "_check_channel_modal", ...)` in tests affects the running
         # loop; otherwise the method captured at ModalWatchdog init would
@@ -294,6 +304,7 @@ class TmuxManager:
         self._transcript_lag_since: dict[ChannelKey, float] = {}
         self._transcript_lag_warned: set[ChannelKey] = set()
         self._transcript_last_offsets: dict[ChannelKey, int] = {}
+        self._codex_update_service: object | None = None
 
     # --- Backwards-compatible accessors ---
 
@@ -329,6 +340,9 @@ class TmuxManager:
         self._bot = bot
         self._topic_config = topic_config
 
+    def wire_codex_update_service(self, service: object) -> None:
+        self._codex_update_service = service
+
     def live_buffer_available(self) -> bool:
         """True if wire_live_buffer() has been called — buffers can be built."""
         return self._bot is not None and self._topic_config is not None
@@ -345,7 +359,68 @@ class TmuxManager:
         """Return the current LiveStatusBuffer for a channel, if any."""
         return self._buffers.get(channel_key)
 
-    async def set_buffer(self, channel_key: ChannelKey, new_buffer: object) -> None:
+    async def queue_buffer(self, channel_key: ChannelKey, new_buffer: object) -> None:
+        """Queue a placeholder until the transcript confirms the next turn."""
+        async with self._buffer_lock:
+            self._pending_buffers.setdefault(channel_key, deque()).append(new_buffer)
+
+    async def activate_next_buffer(
+        self,
+        channel_key: ChannelKey,
+        turn_id: str | None,
+    ) -> None:
+        """Give the next queued placeholder to a confirmed provider turn."""
+        async with self._buffer_lock:
+            pending = self._pending_buffers.get(channel_key)
+            new_buffer = pending.popleft() if pending else None
+            if pending is not None and not pending:
+                self._pending_buffers.pop(channel_key, None)
+            if new_buffer is None:
+                if channel_key in self._buffers:
+                    self._buffer_turn_ids[channel_key] = turn_id
+                return
+            old = self._buffers.get(channel_key)
+            self._buffers[channel_key] = new_buffer
+            self._buffer_turn_ids[channel_key] = turn_id
+        if old is not None and old is not new_buffer:
+            close = getattr(old, "close", None)
+            if close is not None:
+                with contextlib.suppress(Exception):
+                    await close()
+
+    async def discard_next_buffer(self, channel_key: ChannelKey) -> None:
+        """Close one queued placeholder when the confirmed turn is not live."""
+        async with self._buffer_lock:
+            pending = self._pending_buffers.get(channel_key)
+            buffer = pending.popleft() if pending else None
+            if pending is not None and not pending:
+                self._pending_buffers.pop(channel_key, None)
+        if buffer is not None:
+            close = getattr(buffer, "close", None)
+            if close is not None:
+                with contextlib.suppress(Exception):
+                    await close()
+
+    async def discard_last_buffer(self, channel_key: ChannelKey) -> None:
+        """Discard the newest candidate when its prompt delivery failed."""
+        async with self._buffer_lock:
+            pending = self._pending_buffers.get(channel_key)
+            buffer = pending.pop() if pending else None
+            if pending is not None and not pending:
+                self._pending_buffers.pop(channel_key, None)
+        if buffer is not None:
+            close = getattr(buffer, "close", None)
+            if close is not None:
+                with contextlib.suppress(Exception):
+                    await close()
+
+    async def set_buffer(
+        self,
+        channel_key: ChannelKey,
+        new_buffer: object,
+        *,
+        turn_id: str | None = None,
+    ) -> None:
         """Install a new LiveStatusBuffer, closing any existing one atomically.
 
         Atomic under self._buffer_lock so the tail's sender never ends up
@@ -355,26 +430,82 @@ class TmuxManager:
         async with self._buffer_lock:
             old = self._buffers.get(channel_key)
             self._buffers[channel_key] = new_buffer
+            self._buffer_turn_ids[channel_key] = turn_id
         if old is not None:
             close = getattr(old, "close", None)
             if close is not None:
                 with contextlib.suppress(Exception):
                     await close()
 
-    async def close_buffer(self, channel_key: ChannelKey) -> None:
+    async def close_buffer(
+        self,
+        channel_key: ChannelKey,
+        turn_id: str | None = None,
+    ) -> None:
         """Close and forget the buffer for a channel. Idempotent."""
         async with self._buffer_lock:
+            owner = self._buffer_turn_ids.get(channel_key)
+            if turn_id is not None and owner is not None and owner != turn_id:
+                return
             old = self._buffers.pop(channel_key, None)
-        if old is None:
-            return
-        close = getattr(old, "close", None)
-        if close is not None:
-            with contextlib.suppress(Exception):
-                await close()
+            self._buffer_turn_ids.pop(channel_key, None)
+            pending = (
+                list(self._pending_buffers.pop(channel_key, deque())) if turn_id is None else []
+            )
+        for buffer in ([old] if old is not None else []) + pending:
+            close = getattr(buffer, "close", None)
+            if close is not None:
+                with contextlib.suppress(Exception):
+                    await close()
+
+    async def close_active_buffer(self, channel_key: ChannelKey) -> None:
+        """Close only the current turn's buffer, preserving queued candidates."""
+        async with self._buffer_lock:
+            old = self._buffers.pop(channel_key, None)
+            self._buffer_turn_ids.pop(channel_key, None)
+        if old is not None:
+            close = getattr(old, "close", None)
+            if close is not None:
+                with contextlib.suppress(Exception):
+                    await close()
 
     def is_processing(self, channel_key: ChannelKey) -> bool:
         """True if CC is actively processing a prompt for this channel."""
         return self._is_processing.get(channel_key, False)
+
+    def mark_prompt_pending(self, channel_key: ChannelKey) -> None:
+        self._pending_processing[channel_key] = self._pending_processing.get(channel_key, 0) + 1
+        self._is_processing[channel_key] = True
+
+    def handle_turn_event(self, channel_key: ChannelKey, event: StreamEvent) -> None:
+        """Update processing ownership from normalized provider turn events."""
+        turn_id = event.turn_id
+        turns = self._processing_turns.setdefault(channel_key, set())
+        if event.type == "turn_start":
+            if turn_id is not None:
+                turns.add(turn_id)
+            pending = self._pending_processing.get(channel_key, 0)
+            if pending > 1:
+                self._pending_processing[channel_key] = pending - 1
+            else:
+                self._pending_processing.pop(channel_key, None)
+        elif event.type == "turn_end":
+            if turn_id is not None:
+                turns.discard(turn_id)
+        elif turn_id is not None:
+            # Recovery may resume after the persisted turn_start boundary.
+            turns.add(turn_id)
+
+        if not turns:
+            self._processing_turns.pop(channel_key, None)
+        self._is_processing[channel_key] = bool(
+            self._processing_turns.get(channel_key) or self._pending_processing.get(channel_key, 0)
+        )
+
+    def clear_processing(self, channel_key: ChannelKey) -> None:
+        self._is_processing.pop(channel_key, None)
+        self._processing_turns.pop(channel_key, None)
+        self._pending_processing.pop(channel_key, None)
 
     def is_active(self, channel_key: ChannelKey) -> bool:
         """True if this channel has a live tmux session."""
@@ -391,6 +522,22 @@ class TmuxManager:
         cadence.
         """
         return len(self._sessions)
+
+    def has_live_provider(
+        self,
+        provider: str,
+        *,
+        exclude_channel: ChannelKey | None = None,
+    ) -> bool:
+        """True when any tracked live tmux session belongs to ``provider``."""
+        for key, state in self._sessions.items():
+            if exclude_channel is not None and key == exclude_channel:
+                continue
+            if state.provider != provider:
+                continue
+            if self._tmux_alive(state.session_name):
+                return True
+        return False
 
     def get_session_id(self, channel_key: ChannelKey) -> str | None:
         """Return current CC session_id for a channel."""
@@ -430,6 +577,31 @@ class TmuxManager:
         """
         state = self._sessions.get(channel_key)
         return self.expected_epoch(state) if state else None
+
+    @staticmethod
+    def _pane_has_modal(state: TmuxSessionState, pane: str) -> bool:
+        """Apply the provider-specific modal detector to one pane snapshot."""
+        if state.provider == "codex":
+            return CODEX_ADAPTER.is_modal_present(pane)
+        return is_modal_present(pane)
+
+    def observe_tui_pane(
+        self,
+        channel_key: ChannelKey,
+        expected_epoch: str,
+        pane: str,
+    ) -> None:
+        """End the current modal lifecycle after a current non-modal snapshot.
+
+        Inline TUI callbacks capture panes outside the manager lifecycle lock.
+        Bind that observation to the callback epoch so a stale keyboard cannot
+        clear the alert latch for a replacement tmux session.
+        """
+        state = self._sessions.get(channel_key)
+        if state is None or self.expected_epoch(state) != expected_epoch:
+            return
+        if not self._pane_has_modal(state, pane):
+            self._modal_alerted_channels.discard(channel_key)
 
     def get_provider_model(self, channel_key: ChannelKey) -> tuple[str | None, str | None]:
         """Return (provider, model) for the live tmux session, or (None, None).
@@ -546,6 +718,8 @@ class TmuxManager:
         )
         transcript_abs: str | None = None
         if provider == "codex":
+            if resume_session_id is None:
+                await self._maybe_auto_update_codex(channel_key)
             if resume_session_id is not None:
                 session_id = resume_session_id
                 startup_cmd = CODEX_ADAPTER.build_tui_resume(
@@ -576,6 +750,7 @@ class TmuxManager:
                 mode=mode,
                 mcp_config=mcp_config,
                 resume_session_id=resume_session_id,
+                model=model,
             )
             # Seek past all events already in the transcript — they were
             # delivered to Telegram in the previous run. offset=0 would
@@ -587,6 +762,7 @@ class TmuxManager:
                 mode=mode,
                 mcp_config=mcp_config,
                 session_id_new=session_id,
+                model=model,
             )
             initial_offset = 0
 
@@ -649,6 +825,7 @@ class TmuxManager:
             )
 
         self._sessions[channel_key] = state
+        self._modal_alerted_channels.discard(channel_key)
         self._save_state()
         # Now that the session is registered, drop the probe-blocked flag.
         # Future spawns (clear_context / new) start fresh; the flag only
@@ -664,6 +841,26 @@ class TmuxManager:
             initial_offset,
             is_probe_blocked,
         )
+
+    async def _maybe_auto_update_codex(self, channel_key: ChannelKey) -> None:
+        service = self._codex_update_service
+        if service is None:
+            return
+        run_auto = getattr(service, "run_auto", None)
+        if run_auto is None:
+            return
+        try:
+            result = await run_auto(
+                active_check=lambda: self.has_live_provider("codex", exclude_channel=channel_key)
+            )
+        except Exception:
+            logger.warning("Codex auto-update failed before tmux spawn", exc_info=True)
+            return
+        status = getattr(result, "status", None)
+        if status == "already_running":
+            raise RuntimeError("Codex update is already running; try again when it finishes")
+        if status not in {"skipped_cooldown", "blocked_active_sessions", "disabled"}:
+            logger.info("Codex auto-update before tmux spawn finished: status=%s", status)
 
     async def _spawn_tmux(
         self,
@@ -1018,6 +1215,11 @@ class TmuxManager:
                 reason="claude_modal_before_send",
             )
             return False
+
+        # A successful non-modal observation closes any previously alerted
+        # lifecycle. If another modal appears while this prompt is being
+        # pasted, it is a new event and must produce its own alert.
+        self._modal_alerted_channels.discard(channel_key)
 
         # Step 2 — bracketed paste, no Enter yet.
         try:
@@ -1458,18 +1660,19 @@ class TmuxManager:
         Algorithm (post-2026-04-26 simplification — Tab branches removed):
 
           1. capture pane_before, abort if a modal is already up.
-          2. up to 3 paste attempts: send_text_to_tmux, poll for the
-             prompt or `[Pasted Content]` chip to appear in the input
-             bar; check for a modal between attempts.
-          3. capture pane_pre_enter, abort if a modal raced in after
-             the paste landed.
+          2. paste exactly once, then poll across 3 visibility windows
+             for the prompt or `[Pasted Content]` chip to appear in the
+             input bar; check for a modal between observations.
+          3. capture pane_pre_enter, abort if a modal raced in or the
+             current prompt/chip is no longer visible.
           4. up to 3 Enter attempts: send Enter, settle, capture; abort
              on modal_after_enter; succeed on input-bar cleared OR a
              queue marker that names this prompt.
 
-        Every abort path posts a modal alert with a `reason` keyword that
-        names the failure shape — those reasons grep cleanly in the
-        TUI_ALERT_AUDIT log.
+        Every abort path posts an alert with a `reason` keyword that names
+        the failure shape — those reasons grep cleanly in the TUI_ALERT_AUDIT
+        log. A paste-visibility timeout is reported as unknown delivery,
+        because a delayed PTY paste could still land after the final poll.
 
         Tab is *not* used here. Empirical 2026-04-26 22:13 UTC test on
         a busy codex confirmed Enter queues a follow-up identically to
@@ -1495,58 +1698,22 @@ class TmuxManager:
             )
             return False
 
+        # Same lifecycle boundary as the Claude path above. The caller holds
+        # the per-channel lock, so the watchdog cannot race this transition.
+        self._modal_alerted_channels.discard(channel_key)
+
+        try:
+            await send_text_to_tmux(session_name, prompt, submit_enter=False)
+        except (OSError, subprocess.SubprocessError):
+            logger.warning("TUI_IO: codex send-paste failed session=%s", session_name)
+            await self._send_modal_alert(
+                channel_key, state, prompt, pane_before, reason="paste_send_error"
+            )
+            return False
+
         pane_after = pane_before
         delivered = False
-        for paste_attempt in range(1, _CODEX_PASTE_RETRY_LIMIT + 1):
-            # Double-check before re-pasting: when codex is mid-warmup
-            # the FIRST paste may land AFTER the previous attempt's poll
-            # deadline but BEFORE we get here. Issuing another paste in
-            # that case duplicates the prompt in the input bar — exactly
-            # the prod regression we saw 2026-04-26 23:36 UTC where the
-            # user's message appeared 3-4 times stacked. Capture once
-            # and check; only paste again if still not visible.
-            if paste_attempt > 1:
-                pane_recheck = await capture_pane(session_name)
-                if CODEX_ADAPTER.is_modal_present(pane_recheck):
-                    logger.info(
-                        "TUI_IO: codex modal raced into pane between paste attempts "
-                        "session=%s attempt=%d",
-                        session_name,
-                        paste_attempt,
-                    )
-                    await self._send_modal_alert(
-                        channel_key,
-                        state,
-                        prompt,
-                        pane_recheck,
-                        reason="modal_during_paste",
-                    )
-                    return False
-                if self._codex_delivery_visible(
-                    pane_before, pane_recheck, prompt
-                ) or self._codex_pasted_content_visible(pane_recheck):
-                    logger.info(
-                        "TUI_IO: codex previous paste landed late session=%s attempt=%d",
-                        session_name,
-                        paste_attempt,
-                    )
-                    pane_after = pane_recheck
-                    delivered = True
-                    break
-
-            try:
-                await send_text_to_tmux(session_name, prompt, submit_enter=False)
-            except (OSError, subprocess.SubprocessError):
-                logger.warning(
-                    "TUI_IO: codex send-paste failed session=%s attempt=%d",
-                    session_name,
-                    paste_attempt,
-                )
-                await self._send_modal_alert(
-                    channel_key, state, prompt, pane_before, reason="paste_send_error"
-                )
-                return False
-
+        for visibility_attempt in range(1, _CODEX_PASTE_VISIBILITY_ATTEMPT_LIMIT + 1):
             # Do-while semantics: at least one capture per attempt even
             # if budget is zero (unit tests patch budget to 0 to keep
             # them fast; we still need one observation to decide).
@@ -1558,9 +1725,7 @@ class TmuxManager:
                 if CODEX_ADAPTER.is_modal_present(pane_after):
                     modal_seen = True
                     break
-                if self._codex_delivery_visible(
-                    pane_before, pane_after, prompt
-                ) or self._codex_pasted_content_visible(pane_after):
+                if self._codex_delivery_visible(pane_before, pane_after, prompt):
                     delivered = True
                     break
                 if time.monotonic() >= deadline:
@@ -1568,9 +1733,10 @@ class TmuxManager:
 
             if modal_seen:
                 logger.info(
-                    "TUI_IO: send BLOCKED session=%s reason=modal_during_paste attempt=%d",
+                    "TUI_IO: send BLOCKED session=%s "
+                    "reason=modal_during_paste visibility_attempt=%d",
                     session_name,
-                    paste_attempt,
+                    visibility_attempt,
                 )
                 await self._send_modal_alert(
                     channel_key, state, prompt, pane_after, reason="modal_during_paste"
@@ -1580,9 +1746,10 @@ class TmuxManager:
                 break
 
             logger.info(
-                "TUI_IO: codex paste not yet visible session=%s attempt=%d; retrying",
+                "TUI_IO: codex paste not yet visible session=%s "
+                "visibility_attempt=%d; continuing observation",
                 session_name,
-                paste_attempt,
+                visibility_attempt,
             )
 
         if not delivered:
@@ -1592,7 +1759,7 @@ class TmuxManager:
             logger.warning(
                 "TUI_IO: codex paste not landed session=%s attempts=%d pane_tail=\n%s",
                 session_name,
-                _CODEX_PASTE_RETRY_LIMIT,
+                _CODEX_PASTE_VISIBILITY_ATTEMPT_LIMIT,
                 pane_tail,
             )
             await self._send_modal_alert(
@@ -1612,6 +1779,22 @@ class TmuxManager:
             )
             await self._send_modal_alert(
                 channel_key, state, prompt, pane_pre_enter, reason="modal_after_paste"
+            )
+            return False
+
+        if not pane_pre_enter or not self._codex_delivery_visible(
+            pane_before, pane_pre_enter, prompt
+        ):
+            logger.info(
+                "TUI_IO: send BLOCKED session=%s reason=paste_visibility_lost_before_enter",
+                session_name,
+            )
+            await self._send_modal_alert(
+                channel_key,
+                state,
+                prompt,
+                pane_pre_enter or pane_after,
+                reason="paste_visibility_lost_before_enter",
             )
             return False
 
@@ -1784,10 +1967,6 @@ class TmuxManager:
         return "queued follow-up inputs" in normalized or "edit last queued message" in normalized
 
     @staticmethod
-    def _codex_pasted_content_visible(pane: str) -> bool:
-        return "[pasted content" in pane.casefold()
-
-    @staticmethod
     def _codex_prompt_still_in_input_bar(pane: str, prompt: str) -> bool:
         bar = codex_input_bar_content(pane)
         if not bar:
@@ -1886,11 +2065,15 @@ class TmuxManager:
         if not await self._safe_send_and_enter(channel_key, state, prompt):
             return False
 
-        # Enter was delivered — flag must be set for the tail loop / busy
-        # checks; send_stream's finally block clears it. For the pure
-        # send_direct path (no tail loop follows), the tail-runner's
-        # result_message will clear it, or cancel() will on timeout.
-        self._is_processing[channel_key] = True
+        # Enter was delivered — normalized turn boundaries now own the busy
+        # flag; cancel/session teardown remains the safety cleanup.
+        # Codex records an additional user_message inside the current
+        # turn as a clarification, not as a queued new turn. Keep the active
+        # turn as the sole processing owner so task_complete can clear it.
+        if state.provider == "codex" and self._processing_turns.get(channel_key):
+            self._is_processing[channel_key] = True
+        else:
+            self.mark_prompt_pending(channel_key)
         logger.info("TUI_IO: send_direct delivered session=%s", session_name)
         return True
 
@@ -2167,36 +2350,35 @@ class TmuxManager:
 
     async def _check_channel_modal(self, channel_key: ChannelKey) -> None:
         """Single watchdog probe for one channel: skip when a send_direct
-        is in flight, capture the pane, de-dup against the last alerted
-        snapshot, detect, and post an idle-alert on a hit. If the pane no
-        longer shows a modal, clear the dedup entry so a future modal
-        (even with an identical pane hash by coincidence) will fire again."""
-        lock = self._channel_locks.get(channel_key)
-        if lock is not None and lock.locked():
+        is in flight, capture the pane, and post one idle-alert per continuous
+        modal lifecycle. Pane redraws do not re-alert. Once the pane no longer
+        shows a modal, clear the latch so a future modal can fire again."""
+        lock = self._get_channel_lock(channel_key)
+        if lock.locked():
             return
-        state = self._sessions.get(channel_key)
-        if state is None:
-            return
-        pane = await capture_pane(state.session_name)
-        if not pane:
-            return
-        modal_present = (
-            CODEX_ADAPTER.is_modal_present(pane)
-            if state.provider == "codex"
-            else is_modal_present(pane)
-        )
-        if modal_present:
-            if self._last_modal_pane.get(channel_key) == pane:
+
+        # Own the lifecycle lock for the entire observation and alert send.
+        # Merely sampling lock.locked() leaves a race where a session can be
+        # replaced between capture and Telegram delivery.
+        async with lock:
+            state = self._sessions.get(channel_key)
+            if state is None:
                 return
-            await self._send_modal_idle_alert(channel_key, state, pane)
-        else:
-            self._last_modal_pane.pop(channel_key, None)
+            pane = await capture_pane(state.session_name)
+            if not pane:
+                return
+            if self._pane_has_modal(state, pane):
+                if channel_key in self._modal_alerted_channels:
+                    return
+                await self._send_modal_idle_alert(channel_key, state, pane)
+            else:
+                self._modal_alerted_channels.discard(channel_key)
 
     async def send_stream(
         self,
         channel_key: ChannelKey,
         prompt: str,
-        on_event: Callable[[StreamEvent], Awaitable[None] | None],
+        on_event: Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
     ) -> str:
         """Send user message to persistent CC TUI and tail transcript until done.
 
@@ -2213,23 +2395,15 @@ class TmuxManager:
         state: TmuxSessionState | None = None
         output_path: Path | None = None
 
-        async def _on_event_with_processing(event: StreamEvent) -> None:
+        async def _on_event_with_processing(event: StreamEvent) -> bool | None:
             if event.type == "result":
-                # Bare sentinel (empty result) — CC finished without text output.
-                # Clear flag only; nothing to forward to on_event.
-                self._is_processing[channel_key] = False
-                return
+                self.clear_processing(channel_key)
+                return None
             ret = on_event(event)
             if asyncio.iscoroutine(ret):
-                await ret
-            if event.type in ("result_message", "text"):
-                # Clear after Telegram send completes — avoids starting a new
-                # "Thinking..." indicator while the result is still mid-post.
-                # `text` also clears: the Claude TUI transcript never emits
-                # result/result_message (text blocks ARE the response), so
-                # without this the flag stays True until the tail dies and
-                # /mode, /engine, /recycle busy-reject forever.
-                self._is_processing[channel_key] = False
+                ret = await ret
+            self.handle_turn_event(channel_key, event)
+            return cast(bool | None, ret)
 
         try:
             async with self._get_channel_lock(channel_key):
@@ -2273,6 +2447,7 @@ class TmuxManager:
                 if not delivered:
                     # _safe_send_and_enter posted an alert; do not start tail.
                     return ""
+                self.mark_prompt_pending(channel_key)
 
                 if needs_codex_discovery and codex_snapshot is not None:
                     try:
@@ -2325,7 +2500,7 @@ class TmuxManager:
         finally:
             if self._cancel_events.get(channel_key) is cancel_event:
                 self._cancel_events.pop(channel_key, None)
-            self._is_processing.pop(channel_key, None)
+            self.clear_processing(channel_key)
 
     async def cancel(self, channel_key: ChannelKey) -> None:
         """Interrupt CC processing and cancel the tail loop.
@@ -2371,7 +2546,7 @@ class TmuxManager:
         # send_direct callers never install _on_event_with_processing, so
         # without this clear the flag would stay True forever after /kill
         # or /cancel — and any subsequent busy-check would be stuck.
-        self._is_processing.pop(channel_key, None)
+        self.clear_processing(channel_key)
 
         # Offset is maintained incrementally by _tail_until_done — no
         # post-cancel recompute needed.
@@ -2465,6 +2640,7 @@ class TmuxManager:
                 mode=candidate.mode,
                 mcp_config=candidate.mcp_config,
                 session_id_new=new_session_id,
+                model=candidate.model,
             )
             candidate.session_id = new_session_id
             candidate.transcript_path = None
@@ -2489,6 +2665,7 @@ class TmuxManager:
             raise
         self._commit_state(state, candidate)
         self._sessions[channel_key] = state
+        self._modal_alerted_channels.discard(channel_key)
         self._save_state()
         logger.info(
             "Respawned tmux session %s with fresh CC session %s",
@@ -2581,6 +2758,7 @@ class TmuxManager:
                 mode=candidate.mode,
                 mcp_config=candidate.mcp_config,
                 resume_session_id=new_session_id,
+                model=candidate.model,
             )
         try:
             await self._spawn_tmux(
@@ -2603,6 +2781,7 @@ class TmuxManager:
         candidate.offset = self._file_size(target_transcript)
         self._commit_state(state, candidate)
         self._sessions[channel_key] = state
+        self._modal_alerted_channels.discard(channel_key)
         self._save_state()
         logger.info(
             "Switched tmux session %s to CC session %s (offset=%d)",
@@ -2643,6 +2822,8 @@ class TmuxManager:
             engine_changed = target_provider != runtime.engine
             mode_changed = runtime.exec_mode != "tmux"
             captured_alive = bool(captured and self._tmux_alive(captured.session_name))
+            models = settings.models if isinstance(settings.models, dict) else {}
+            target_model = models.get(target_provider)
             if mode_changed and engine_changed:
                 ok = await topic_config.update_engine_model_exec_mode(
                     thread_id,
@@ -2652,17 +2833,25 @@ class TmuxManager:
                 )
                 if not ok:
                     return SwitchResult(kind="config_write_failed")
-                runtime = replace(runtime, engine=target_provider, model=None, exec_mode="tmux")
+                runtime = replace(
+                    runtime,
+                    engine=target_provider,
+                    model=target_model,
+                    exec_mode="tmux",
+                )
             elif mode_changed:
                 ok = await topic_config.update_exec_mode(thread_id, "tmux")
                 if not ok:
                     return SwitchResult(kind="config_write_failed")
                 runtime = replace(runtime, exec_mode="tmux")
             elif engine_changed:
-                ok = await topic_config.update_engine_model(thread_id, target_provider, None)
+                if models:
+                    ok = await topic_config.update_engine(thread_id, target_provider)
+                else:
+                    ok = await topic_config.update_engine_model(thread_id, target_provider, None)
                 if not ok:
                     return SwitchResult(kind="config_write_failed")
-                runtime = replace(runtime, engine=target_provider, model=None)
+                runtime = replace(runtime, engine=target_provider, model=target_model)
 
             if (
                 captured_alive
@@ -2737,6 +2926,7 @@ class TmuxManager:
                     await self._wait_for_tail_exit(channel_key)
                 await self._kill_tmux_only(channel_key, captured)
             self._sessions[channel_key] = new_state
+            self._modal_alerted_channels.discard(channel_key)
             self._save_state()
             if engine_changed:
                 clear_provider = getattr(session_manager, "clear_provider_session", None)
@@ -2752,11 +2942,11 @@ class TmuxManager:
         """Kill tmux session for the channel.
 
         Wave 3 3.5: additionally clears per-channel transient state
-        (`_last_modal_pane`, `_channel_locks`, `_spawn_deadlines`, `_buffers`)
+        (`_modal_alerted_channels`, `_channel_locks`, `_spawn_deadlines`, `_buffers`)
         so a subsequent `start_session` on the same channel starts from a
         clean slate. Without this, stale send-locks from a killed session
-        could serialise unrelated work, and a stale `_last_modal_pane`
-        entry could suppress a new session's modal alert.
+        could serialise unrelated work, and a stale modal-alert latch could
+        suppress a new session's modal alert.
         """
         async with self._get_channel_lock(channel_key):
             await self._kill_session_unlocked(channel_key)
@@ -2813,6 +3003,7 @@ class TmuxManager:
                     mode=candidate.mode,
                     mcp_config=candidate.mcp_config,
                     resume_session_id=resume_id,
+                    model=candidate.model,
                 )
             else:
                 resume_id = generate_session_uuid()
@@ -2821,6 +3012,7 @@ class TmuxManager:
                     mode=candidate.mode,
                     mcp_config=candidate.mcp_config,
                     session_id_new=resume_id,
+                    model=candidate.model,
                 )
 
             try:
@@ -2852,6 +3044,7 @@ class TmuxManager:
                 candidate.offset = self._file_size(transcript) if transcript else 0
             self._commit_state(state, candidate)
             self._sessions[channel_key] = state
+            self._modal_alerted_channels.discard(channel_key)
             self._save_state()
             logger.info(
                 "Recycled tmux session %s for channel %s", candidate.session_name, channel_key
@@ -2873,7 +3066,7 @@ class TmuxManager:
 
         # Clear per-channel transient state except the lifecycle lock. Locks
         # are intentionally stable so waiters cannot split across old/new locks.
-        self._last_modal_pane.pop(channel_key, None)
+        self._modal_alerted_channels.discard(channel_key)
         self._spawn_deadlines.pop(channel_key, None)
 
     async def _kill_tmux_only(self, channel_key: ChannelKey, state: TmuxSessionState) -> None:
@@ -2941,7 +3134,10 @@ class TmuxManager:
 
     async def resume_tails(
         self,
-        on_event_factory: Callable[[ChannelKey], Callable[[StreamEvent], Awaitable[None] | None]],
+        on_event_factory: Callable[
+            [ChannelKey],
+            Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
+        ],
     ) -> None:
         """Start recovery tails for all alive sessions on bot startup.
 
@@ -2999,7 +3195,7 @@ class TmuxManager:
         channel_key: ChannelKey,
         state: TmuxSessionState,
         output_path: Path,
-        on_event: Callable[[StreamEvent], Awaitable[None] | None],
+        on_event: Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
         cancel_event: asyncio.Event,
     ) -> None:
         """Delegate to `tmux_recovery.run_recovery_tail`.
@@ -3271,7 +3467,7 @@ class TmuxManager:
         self,
         output_path: Path,
         state: TmuxSessionState,
-        on_event: Callable[[StreamEvent], Awaitable[None] | None],
+        on_event: Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
         cancel_event: asyncio.Event,
         *,
         idle_exit_sec: float | None = None,

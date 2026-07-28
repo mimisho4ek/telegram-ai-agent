@@ -24,7 +24,7 @@ CLI на вашем VPS. Он превращает Telegram в удаленны�
   subprocess для простых разовых задач.
 - Отправлять текст, фото, документы, пачки forwarded messages, Telegram rich
   messages и, опционально, voice messages.
-- Делать свои prompt modes под разные сценарии.
+- Настраивать bundled example prompt под второй workflow.
 - Открывать live TUI snapshot через `/tui` и нажимать кнопки Enter, Esc,
   стрелки, цифры, refresh и close.
 - Возобновлять старые сессии через reply на сообщения бота или через `/resume`.
@@ -167,6 +167,9 @@ TOPIC_CONFIG_PATH=./topic_config.json
 TMUX_SESSIONS_DIR=./tmux_sessions
 CC_MAX_TURNS=100
 CC_INACTIVITY_KILL_SEC=1800
+CODEX_AUTO_UPDATE_ENABLED=true
+CODEX_UPDATE_TIMEOUT_SEC=180
+CODEX_UPDATE_COOLDOWN_SEC=86400
 ```
 
 Пояснения:
@@ -177,6 +180,8 @@ CC_INACTIVITY_KILL_SEC=1800
 - `BOT_LANG`: `en` или `ru`. После смены языка перезапустите бота.
 - `DEFAULT_CWD`: рабочая папка по умолчанию для ненастроенных топиков.
 - `DEEPGRAM_API_KEY`: оставьте пустым, если не нужны voice messages.
+- `CODEX_AUTO_UPDATE_ENABLED`: включает автоматические и ручные обновления
+  Codex. Timeout ограничивает любое обновление, cooldown — только автоматические.
 
 Запустите в foreground:
 
@@ -242,8 +247,7 @@ skill настроить topics.
       "mcp_config": null,
       "stream_mode": "live",
       "exec_mode": "tmux",
-      "engine": "codex",
-      "model": null
+      "engine": "codex"
     }
   }
 }
@@ -260,11 +264,17 @@ skill настроить topics.
 - `stream_mode`: `verbose`, `live` или `minimal`.
 - `exec_mode`: `tmux` или `subprocess`.
 - `engine`: `claude` или `codex`.
-- `model`: опциональный override модели или `null`.
+- `model`: legacy single override модели или `null`.
+- `models`: опциональные per-engine overrides с ключами `claude` и/или
+  `codex`. Порядок выбора: `models[active_engine]`, затем `model`, затем default
+  провайдера; ручной `/engine` сохраняет всю map. При automatic missing-CLI
+  fallback первый запрос использует default нового провайдера, а сохранённый
+  per-engine override применяется со следующего запроса.
 
-Для `cwd` и `mcp_config` используйте absolute paths. Ставьте `mcp_config` в
-`null`, если у вас еще нет настоящего MCP config file для проекта. Не коммитьте
-настоящий `topic_config.json`.
+Для `cwd` и `mcp_config` используйте absolute paths. По умолчанию оставляйте
+`mcp_config` равным `null`. Project MCP config подключайте только после проверки
+на secrets и private dependencies; дополнительные servers имеют собственные
+provider/tool-policy ограничения. Не коммитьте настоящий `topic_config.json`.
 
 ## Prompt Modes
 
@@ -277,11 +287,10 @@ Prompt files лежат в `src/telegram_bot/prompts/`.
   `task-manager.md`.
 
 Для no-code customization отредактируйте или замените `task-manager.md` и
-используйте `"mode": "task"` в нужных topics. Если хотите новое имя mode,
-например `blog`, добавьте prompt file и расширьте runtime tool mapping для
-этого mode в коде; иначе у агента может не быть allowed tool list. Не кладите в
-public repo приватные данные, секреты, личные workflows и реальный customer
-context.
+сохраните `"mode": "task"` в нужных topics. Новый mode name требует изменений
+runtime resolver, явной tool policy и тестов; одного prompt file недостаточно.
+Не кладите в public repo приватные данные, секреты, личные workflows и реальный
+customer context.
 
 ## Execution Modes
 
@@ -323,10 +332,13 @@ entry.
 
 `/stream` управляет тем, сколько прогресса бот отправляет в Telegram.
 
-- `verbose`: подробный прогресс отдельными сообщениями. Полезно для debugging.
-- `live`: один редактируемый progress message плюс финальный ответ. Лучший
-  default для большинства проектных задач.
-- `minimal`: в основном финальные ответы. Хорошо, когда нужен тихий чат.
+- `verbose`: каждый tool/status event приходит отдельным тихим сообщением.
+- `live`: tool/status events собираются в один редактируемый progress message.
+- `minimal`: tool/status events полностью скрываются.
+
+Human-readable промежуточные обновления остаются отдельными сообщениями во всех
+режимах. Нормализованный финальный ответ всегда приходит как один отдельный
+логический ответ. `live` — лучший default для большинства проектных задач.
 
 ## TUI Mode
 
@@ -380,6 +392,10 @@ Slash commands устроены отдельно: в tmux topics non-bot command
   переключении с `tmux` на `subprocess` активная tmux session останавливается.
 - `/engine`: только forum topics; выбрать Claude Code или Codex. Смена engine
   сбрасывает активную session.
+- `/codex_update`: обновить Codex CLI вручную. Команда обходит automatic
+  cooldown, но блокируется другим bot-managed обновлением в этом процессе или
+  bot-managed активными Codex sessions. `/codex_update status` показывает
+  последний redacted result.
 - `/stream`: только forum topics; выбрать `verbose`, `live` или `minimal`.
 - `/resume`: только forum topics; возобновить сохраненную tmux session для cwd
   текущего topic.

@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -42,7 +42,7 @@ Engine = Literal["claude", "codex"]
 _VALID_ENGINES: set[str] = {"claude", "codex"}
 _DEFAULT_ENGINE: Engine = "claude"
 _MODEL_OVERRIDE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
-_CORE_PROMPT_MODES: set[str] = {"task", "knowledge", "free", "project", "blog"}
+_CORE_PROMPT_MODES: set[str] = {"task", "knowledge", "assistant", "free", "project", "blog"}
 
 _valid_modes_cache: tuple[int, set[str]] = (-1, set())
 
@@ -75,13 +75,14 @@ class TopicSettings:
 
     name: str
     type: str  # "assistant" | "project"
-    mode: str  # "task" | "knowledge" | "free" | "project"
+    mode: str  # "task" | "knowledge" | "assistant" | "free" | "project"
     cwd: str | None  # None → Settings.default_cwd
     mcp_config: str | None  # None → default (.mcp.bot.json)
     stream_mode: StreamMode = _DEFAULT_STREAM_MODE
     exec_mode: ExecMode = _DEFAULT_EXEC_MODE
     engine: Engine = _DEFAULT_ENGINE
     model: str | None = None
+    models: dict[Engine, str] = field(default_factory=dict)
 
 
 def _default_topic() -> TopicSettings:
@@ -269,6 +270,39 @@ class TopicConfig:
                 if isinstance(raw_model, str) and raw_model.strip() and model is None:
                     logger.warning("Invalid model %r for topic %d, dropping", raw_model, thread_id)
 
+                raw_models = value.get("models")
+                models: dict[Engine, str] = {}
+                if isinstance(raw_models, dict):
+                    for raw_model_engine, raw_model_override in raw_models.items():
+                        if raw_model_engine not in _VALID_ENGINES:
+                            logger.warning(
+                                "Invalid models engine %r for topic %d, dropping",
+                                raw_model_engine,
+                                thread_id,
+                            )
+                            continue
+                        model_override = _normalize_model(raw_model_override)
+                        if (
+                            isinstance(raw_model_override, str)
+                            and raw_model_override.strip()
+                            and model_override is None
+                        ):
+                            logger.warning(
+                                "Invalid models override %r for topic %d engine %s, dropping",
+                                raw_model_override,
+                                thread_id,
+                                raw_model_engine,
+                            )
+                            continue
+                        if model_override is not None:
+                            models[raw_model_engine] = model_override
+                elif raw_models is not None:
+                    logger.warning(
+                        "Invalid models value %r for topic %d, dropping",
+                        raw_models,
+                        thread_id,
+                    )
+
                 topics[thread_id] = TopicSettings(
                     name=name,
                     type=topic_type,
@@ -279,6 +313,7 @@ class TopicConfig:
                     exec_mode=exec_mode,
                     engine=engine,
                     model=model,
+                    models=models,
                 )
 
         # Parse routing

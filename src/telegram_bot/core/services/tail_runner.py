@@ -19,12 +19,13 @@ import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from telegram_bot.core.services.claude import StreamEvent
-from telegram_bot.core.services.providers import CODEX_ADAPTER
-from telegram_bot.core.tui.transcript import parse_transcript_event
+from telegram_bot.core.services.providers import CodexTranscriptParser
+from telegram_bot.core.tui.transcript import ClaudeTranscriptParser
 from telegram_bot.core.types import ChannelKey
 
 
@@ -53,19 +54,14 @@ OFFSET_SAVE_INTERVAL = 10.0  # seconds between periodic offset saves
 ON_EVENT_SLOW_WARN_SEC = 5.0  # warn when a single on_event dispatch exceeds this
 EVENT_QUEUE_BACKLOG_WARN = 500  # warn once per tail when backlog exceeds this
 SENDER_DRAIN_GRACE_SEC = 30.0  # how long we wait for the sender to flush on normal exit
+CLAUDE_TERMINAL_SETTLE_SEC = 0.5  # merge same-request terminal fragments across poll batches
 
-# Codex-only post-`task_complete` grace period. Codex emits the
-# `task_complete` event when it considers the turn finished, but
-# empirically (2026-04-26 incident, plan.md §"Факт 2") it can keep
-# writing the final paragraph 10+ seconds *after* that — and the prior
-# tail loop closed on `done=True` immediately, losing 13 seconds of
-# final answer. The fix: when codex signals done, hold the tail open
-# for this many seconds; any further event resets the timer; only
-# silence past the deadline closes the loop.
-TASK_COMPLETE_GRACE_SEC = 60.0
+OnEventCallable = Callable[[StreamEvent], Awaitable[bool | None] | bool | None]
 
 
-OnEventCallable = Callable[[StreamEvent], Awaitable[None] | None]
+@dataclass(frozen=True)
+class _Checkpoint:
+    offset: int
 
 
 class TailRunner:
@@ -75,7 +71,6 @@ class TailRunner:
 
     * ``cancel_event`` is set (fast exit, drops pending events)
     * ``tmux_alive`` returns False (tmux session died)
-    * a ``result`` event is observed
     * ``idle_exit_sec`` elapsed without any new lines (recovery tails)
     * 6h hard timeout
 
@@ -92,9 +87,7 @@ class TailRunner:
            cancel on cancel-path; on normal path await drain with grace.
         6. transcript_available poll-wait before main loop.
         7. tmux_alive probed on fixed interval (ALIVE_CHECK_INTERVAL).
-        8. result-event enqueues result_message (if content) then result;
-           tail continues (CC TUI never emits this shape — kept for parity
-           with the stream-json-era behaviour to avoid silent drift).
+        8. Provider turn completion never stops the transcript tail.
     """
 
     def __init__(
@@ -130,13 +123,15 @@ class TailRunner:
         # rotated sid does not.
         self._warned_rotated_sids: set[str] = set()
         self._backlog_warned: bool = False
-        self._event_queue: asyncio.Queue[StreamEvent | None] = asyncio.Queue()
-        # Codex post-task_complete grace deadline: monotonic seconds at
-        # which the tail will close if no further events arrive. None
-        # while the turn is still in progress; set when `task_complete`
-        # is observed; pushed forward on every subsequent event so a
-        # late-streaming codex doesn't lose its final paragraph.
-        self._task_complete_grace_deadline: float | None = None
+        self._event_queue: asyncio.Queue[StreamEvent | _Checkpoint | None] = asyncio.Queue()
+        self._read_offset = state.offset
+        self._pending_claude_checkpoint: int | None = None
+        self._pending_claude_since: float | None = None
+        self._parser = (
+            CodexTranscriptParser()
+            if getattr(state, "provider", "claude") == "codex"
+            else ClaudeTranscriptParser()
+        )
 
     async def run(self) -> tuple[str, str | None]:
         """Entry point. Returns (result_text, observed_session_id)."""
@@ -151,6 +146,7 @@ class TailRunner:
 
         if not await self._wait_for_transcript(sender_task):
             return self._result_text, self._session_id
+        await asyncio.to_thread(self._rehydrate_parser)
 
         try:
             while True:
@@ -186,17 +182,9 @@ class TailRunner:
                         self._idle_exit_sec,
                     )
                     break
-                if await self._process_lines(lines):
-                    break
-                if (
-                    self._task_complete_grace_deadline is not None
-                    and time.monotonic() >= self._task_complete_grace_deadline
-                ):
-                    logger.info(
-                        "Tmux tail task_complete grace expired session=%s",
-                        session_name,
-                    )
-                    break
+                await self._process_lines(lines)
+                if not lines:
+                    self._flush_settled_claude_terminal()
 
                 now = time.monotonic()
                 if now - last_offset_save >= OFFSET_SAVE_INTERVAL:
@@ -205,6 +193,13 @@ class TailRunner:
 
                 await asyncio.sleep(POLL_INTERVAL)
         finally:
+            # A confirmed transport stop is the only safe fallback boundary
+            # for an ambiguous Claude completion. Explicit cancellation is a
+            # user action, so it must not manufacture a diagnostic answer.
+            if not self._cancel_event.is_set() and isinstance(self._parser, ClaudeTranscriptParser):
+                for event in self._parser.finish():
+                    self._enqueue(event)
+                self._enqueue_pending_claude_checkpoint()
             # Signal sender to finish. On cancel we don't wait — drop pending
             # events so /clear and kill stay snappy. On normal exit we give
             # the sender a bounded grace period to drain, then cancel it.
@@ -264,15 +259,21 @@ class TailRunner:
         """Drain the event queue, invoking on_event per event.
 
         Isolated from the tail so Telegram flood waits inside on_event
-        (asyncio.sleep(retry_after)) can never block file reads. Exceptions
-        never propagate — a broken send must not kill the stream.
+        (asyncio.sleep(retry_after)) can never block file reads. A callback
+        may return ``False`` when a non-droppable event was not delivered.
+        From that point checkpoints stay pinned so recovery can replay it.
         """
         session_name = self._session_name()
+        checkpoint_blocked = False
         while True:
             event = await self._event_queue.get()
             if event is None:  # sentinel — flush done
                 logger.info("TUI_IO: sender_loop drain-exit session=%s", session_name)
                 return
+            if isinstance(event, _Checkpoint):
+                if not checkpoint_blocked:
+                    self._set_offset(event.offset)
+                continue
             # Per-event dispatch log: DEBUG — fires on every status/tool_use/
             # text frame, INFO would flood journalctl in a long CC run.
             logger.debug(
@@ -285,12 +286,22 @@ class TailRunner:
             try:
                 ret = self._on_event(event)
                 if asyncio.iscoroutine(ret):
-                    await ret
+                    ret = await ret
+                if ret is False:
+                    checkpoint_blocked = True
+                    logger.warning(
+                        "Delivery not acknowledged on %s (event=%s); "
+                        "durable checkpoint pinned for recovery",
+                        session_name,
+                        event.type,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
+                checkpoint_blocked = True
                 logger.warning(
-                    "on_event failed on channel %s (event=%s)",
+                    "on_event failed on channel %s (event=%s); "
+                    "durable checkpoint pinned for recovery",
                     session_name,
                     event.type,
                     exc_info=True,
@@ -304,12 +315,16 @@ class TailRunner:
                     event.type,
                 )
 
-    def _read_new_lines(self) -> list[str]:
-        """Blocking read of new lines from current offset."""
-        lines: list[str] = []
+    def _read_new_lines(self) -> list[tuple[str, int]]:
+        """Read complete lines from the in-memory cursor.
+
+        The durable ``state.offset`` is advanced by the sender only after all
+        events produced by a line finish their Telegram handlers.
+        """
+        lines: list[tuple[str, int]] = []
         try:
             with self._output_path.open("r", errors="replace") as f:
-                f.seek(self._offset())
+                f.seek(self._read_offset)
                 while True:
                     line = f.readline()
                     if not line:
@@ -320,10 +335,13 @@ class TailRunner:
                         # line; don't advance offset until the newline lands,
                         # otherwise the completed JSON object is skipped.
                         break
-                    self._set_offset(f.tell())
+                    line_end = f.tell()
+                    self._read_offset = line_end
                     stripped = line.strip()
                     if stripped:
-                        lines.append(stripped)
+                        lines.append((stripped, line_end))
+                    else:
+                        lines.append(("", line_end))
         except FileNotFoundError:
             pass
         return lines
@@ -340,30 +358,29 @@ class TailRunner:
             )
             self._backlog_warned = True
 
-    async def _process_lines(self, lines: list[str]) -> bool:
+    async def _process_lines(self, lines: list[tuple[str, int]]) -> None:
         """Process parsed JSON lines.
 
-        For CC TUI transcripts this returns False — they don't emit
-        terminal events. For codex, `task_complete` would normally
-        return True (the tail closes); instead we open a grace window
-        (`TASK_COMPLETE_GRACE_SEC`) so codex can keep streaming its
-        final paragraph after declaring done. The grace window is
-        evaluated by the caller in `run()` against
-        `_task_complete_grace_deadline`.
-
-        Any event arriving while the grace window is active resets the
-        deadline — the tail only closes after a full silent grace
-        period.
+        Every line ends with a queue checkpoint. Because the sender consumes
+        FIFO, that checkpoint cannot advance until every event from the line
+        has completed its Telegram callback.
         """
-        for line in lines:
-            done = False
-            if getattr(self._state, "provider", "claude") == "codex":
-                parsed = CODEX_ADAPTER.parse_tui_event(line)
+        for line, line_end in lines:
+            if not line:
+                if (
+                    isinstance(self._parser, ClaudeTranscriptParser)
+                    and self._parser.has_unfinished_completion
+                ):
+                    self._pending_claude_checkpoint = line_end
+                else:
+                    self._event_queue.put_nowait(_Checkpoint(line_end))
+                continue
+            if isinstance(self._parser, CodexTranscriptParser):
+                parsed = self._parser.parse(line)
                 events = parsed.events
                 new_sid = parsed.session_id
-                done = parsed.done
             else:
-                events, new_sid = parse_transcript_event(line)
+                events, new_sid = self._parser.parse(line)
             if new_sid:
                 # Observability only — state.session_id is owned by
                 # start_session / switch_session / clear_context, never by
@@ -380,7 +397,7 @@ class TailRunner:
                         self._session_name(),
                         state_sid,
                         new_sid,
-                        self._offset(),
+                        line_end,
                     )
                     self._warned_rotated_sids.add(new_sid)
 
@@ -396,26 +413,73 @@ class TailRunner:
                     self._enqueue(StreamEvent("result", ""))
                     continue
                 self._enqueue(event)
+            if (
+                isinstance(self._parser, ClaudeTranscriptParser)
+                and self._parser.has_unfinished_completion
+            ):
+                self._pending_claude_checkpoint = line_end
+                if self._parser.has_pending_terminal:
+                    self._pending_claude_since = time.monotonic()
+            else:
+                self._event_queue.put_nowait(_Checkpoint(line_end))
+                self._pending_claude_checkpoint = None
+                self._pending_claude_since = None
 
-            # Reset the grace window on any event that arrives after
-            # task_complete: codex is still streaming, give it more time.
-            if events and self._task_complete_grace_deadline is not None:
-                self._task_complete_grace_deadline = time.monotonic() + TASK_COMPLETE_GRACE_SEC
+    def _flush_settled_claude_terminal(self) -> None:
+        if not isinstance(self._parser, ClaudeTranscriptParser):
+            return
+        if not self._parser.has_pending_terminal or self._pending_claude_since is None:
+            return
+        if time.monotonic() - self._pending_claude_since < CLAUDE_TERMINAL_SETTLE_SEC:
+            return
+        for event in self._parser.flush_pending_terminal():
+            self._enqueue(event)
+        self._enqueue_pending_claude_checkpoint()
 
-            if done:
-                if getattr(self._state, "provider", "claude") == "codex":
-                    if self._task_complete_grace_deadline is None:
-                        self._task_complete_grace_deadline = (
-                            time.monotonic() + TASK_COMPLETE_GRACE_SEC
-                        )
-                        logger.info(
-                            "Tmux tail entered task_complete grace session=%s grace_sec=%.1f",
-                            self._session_name(),
-                            TASK_COMPLETE_GRACE_SEC,
-                        )
-                else:
-                    return True
-        return False
+    def _enqueue_pending_claude_checkpoint(self) -> None:
+        if self._pending_claude_checkpoint is not None:
+            self._event_queue.put_nowait(_Checkpoint(self._pending_claude_checkpoint))
+        self._pending_claude_checkpoint = None
+        self._pending_claude_since = None
+
+    def _rehydrate_parser(self) -> None:
+        """Replay parser state to the confirmed offset without emitting events."""
+        checkpoint = self._offset()
+        self._read_offset = checkpoint
+        if checkpoint <= 0:
+            return
+        try:
+            boundary_offset = 0
+            last_codex_turn_id: str | None = None
+            with self._output_path.open("r", errors="replace") as f:
+                while f.tell() < checkpoint:
+                    line_start = f.tell()
+                    line = f.readline()
+                    if not line or not line.endswith("\n") or f.tell() > checkpoint:
+                        break
+                    raw = line.strip()
+                    if raw and isinstance(self._parser, CodexTranscriptParser):
+                        turn_id = self._parser.turn_boundary_id(raw)
+                        if turn_id is not None and turn_id != last_codex_turn_id:
+                            boundary_offset = line_start
+                            last_codex_turn_id = turn_id
+                    elif raw and self._parser.is_turn_boundary(raw):
+                        boundary_offset = line_start
+
+                f.seek(boundary_offset)
+                while f.tell() < checkpoint:
+                    line = f.readline()
+                    if not line or not line.endswith("\n") or f.tell() > checkpoint:
+                        break
+                    raw = line.strip()
+                    if raw:
+                        self._parser.parse(raw)
+            if isinstance(self._parser, ClaudeTranscriptParser):
+                # A terminal candidate wholly before the durable checkpoint
+                # was already delivered. Finalize it only in parser state.
+                self._parser.flush_pending_terminal()
+        except FileNotFoundError:
+            return
 
     # --- thin accessors on state (structural, see _StateAccess protocol) ---
 

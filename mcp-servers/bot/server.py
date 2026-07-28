@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import time
 from contextlib import ExitStack
 from pathlib import Path
@@ -42,6 +43,11 @@ _PHOTO_FALLBACK_ERRORS = (
     "failed to get http url content",
 )
 _VALID_PARSE_MODES = {"html": "HTML", "markdownv2": "MarkdownV2"}
+# Session config the bot generates per topic; its path sits on the launching
+# agent's command line, which is how an instance started without routing env
+# still finds out which chat it belongs to.
+_SESSION_CONFIG_RE = re.compile(r"[^\s\"']+mcp\.runtime\.json")
+_PARENT_SCAN_DEPTH = 4
 # Flood-wait ceiling: longer waits mean the chat is being hammered — better to
 # surface the 429 to the agent than block the MCP tool call for minutes.
 _MAX_RETRY_AFTER_SEC = 30
@@ -88,6 +94,76 @@ def _env_int(name: str) -> tuple[int | None, str | None]:
         return None, f"Ошибка: {name} должен быть int, получено {raw!r}"
 
 
+def _process_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", errors="replace")
+
+
+def _parent_pid(pid: int) -> int | None:
+    try:
+        status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in status.splitlines():
+        if line.startswith("PPid:"):
+            with contextlib.suppress(IndexError, ValueError):
+                return int(line.split()[1])
+            return None
+    return None
+
+
+def _routing_from_session_config(path: Path) -> tuple[int | None, int | None]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    servers = data.get("mcpServers")
+    bot_server = servers.get("bot") if isinstance(servers, dict) else None
+    env = bot_server.get("env") if isinstance(bot_server, dict) else None
+    if not isinstance(env, dict):
+        return None, None
+
+    def _as_int(key: str) -> int | None:
+        value = env.get(key)
+        if not isinstance(value, str) or value == "":
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
+
+    session_chat = _as_int("TELEGRAM_CHAT_ID")
+    if session_chat is None:
+        return None, None
+    return session_chat, _as_int("TELEGRAM_THREAD_ID")
+
+
+def _routing_from_agent_process() -> tuple[int | None, int | None]:
+    """Derive routing from the agent session that launched this server.
+
+    Bot-launched sessions get their MCP servers from a generated
+    mcp.runtime.json, and its path stays on the launching agent's command
+    line. Instances registered elsewhere — e.g. the duplicates the Claude→Codex
+    sync writes into the shared Codex config — start without routing env; without
+    this lookup they fall back to model-supplied ids, which delivered files into
+    an unrelated topic on 2026-07-25.
+    """
+    pid: int | None = os.getppid()
+    for _ in range(_PARENT_SCAN_DEPTH):
+        if pid is None or pid <= 1:
+            break
+        match = _SESSION_CONFIG_RE.search(_process_cmdline(pid))
+        if match:
+            return _routing_from_session_config(Path(match.group(0)))
+        pid = _parent_pid(pid)
+    return None, None
+
+
 def _resolve_routing(
     chat_id: int | None = None, thread_id: int | None = None
 ) -> tuple[int | None, int | None, str | None]:
@@ -99,14 +175,18 @@ def _resolve_routing(
         return None, None, thread_error
 
     lock_context = os.environ.get("TELEGRAM_CONTEXT_LOCK") == "1"
+    if env_chat_id is None:
+        # Unbound instance: take the session's own routing rather than trusting
+        # arguments — the model has no way to know which topic it is talking in.
+        env_chat_id, env_thread_id = _routing_from_agent_process()
+        if env_chat_id is None:
+            return None, None, "Ошибка: сервер запущен вне Telegram-сессии, чат не определён"
+        lock_context = True
+
     resolved_chat = chat_id if chat_id is not None else env_chat_id
     resolved_thread = thread_id if thread_id is not None else env_thread_id
 
-    if resolved_chat is None:
-        return None, None, "Ошибка: chat_id не передан и TELEGRAM_CHAT_ID не настроен"
     if lock_context:
-        if env_chat_id is None:
-            return None, None, "Ошибка: TELEGRAM_CONTEXT_LOCK=1, но TELEGRAM_CHAT_ID не настроен"
         if chat_id is not None and chat_id != env_chat_id:
             return None, None, "Ошибка: chat_id не совпадает с текущей Telegram-сессией"  # noqa: RUF001
         if thread_id is not None and thread_id != env_thread_id:

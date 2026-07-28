@@ -61,6 +61,19 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⚠️ {engine} started but input is blocked — most likely a modal dialog."
             " Use /tui to see the pane and dismiss it."
         ),
+        "ui.codex_update_status": (
+            "Codex update status: <b>{status}</b>\n"
+            "Last success: <code>{last_success}</code>\n"
+            "{output}"
+        ),
+        "ui.codex_update_running": "🔄 Updating Codex...",
+        "ui.codex_update_success": "✅ Codex update finished.\n<pre>{output}</pre>",
+        "ui.codex_update_failed": "❌ Codex update failed ({status}).\n<pre>{output}</pre>",
+        "ui.codex_update_already_running": "Codex update is already running.",
+        "ui.codex_update_active_sessions": (
+            "⚠️ Codex update skipped: stop active Codex sessions first with /kill."
+        ),
+        "ui.codex_update_cooldown": "Codex auto-update skipped: cooldown is active.",
         # --- UI: tail / tui feature strings (Wave 3 tmux-tui-mode) ----
         "ui.tail_unavailable": (
             "⚠️ No active tmux session — /tui is unavailable."
@@ -72,6 +85,12 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⚠️ Message NOT sent — CC is waiting on a modal dialog.\n"
             "Your message: <code>{prompt}</code>\n"
             "Dismiss the modal (Esc / pick an option), then resend."
+        ),
+        "ui.delivery_unconfirmed_header": (
+            "⚠️ Delivery could not be confirmed — the message may already be "
+            "waiting in Codex input.\n"
+            "Your message: <code>{prompt}</code>\n"
+            "Open /tui and check the input. Do not resend yet."
         ),
         "ui.modal_idle_detected": (
             "⚠️ CC is waiting on a modal dialog.\n"
@@ -131,6 +150,18 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.stream_mode_invalid": "Unknown mode",
         "ui.stream_mode_not_in_forum": "⚠️ /stream works only in forum topics.",
         "ui.stream_mode_write_failed": "Failed to save config",
+        "ui.claude_no_text": "Claude finished the turn without a text response.",
+        "ui.claude_stop_sequence_no_text": (
+            "Claude finished on a stop sequence without a text response."
+        ),
+        "ui.claude_limit_no_text": "Claude reached the output limit without a text response.",
+        "ui.claude_context_no_text": ("Claude reached the context limit without a text response."),
+        "ui.claude_refused_no_text": "Claude refused to answer.",
+        "ui.claude_unknown_completion": (
+            "Claude ended the previous turn with an unknown completion format."
+        ),
+        "ui.claude_limit_note": "\n\n⚠️ The answer was cut off by the output limit.",
+        "ui.claude_context_note": "\n\n⚠️ The answer was cut off by the context limit.",
         "ui.session_switched": "🔄 session: {sid}",
         "ui.session_switched_engine": "🔄 {engine} session: {sid}",
         "ui.resume_picker_caption_hdr": "Sessions for <code>{cwd}</code>, page {page}/{total}",
@@ -302,6 +333,19 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⚠️ {engine} запустился, но ввод заблокирован — скорее всего модальное окно."
             " Открой /tui, чтобы увидеть экран сессии и закрыть его."
         ),
+        "ui.codex_update_status": (
+            "Статус обновления Codex: <b>{status}</b>\n"
+            "Последний успех: <code>{last_success}</code>\n"
+            "{output}"
+        ),
+        "ui.codex_update_running": "🔄 Обновляю Codex...",
+        "ui.codex_update_success": "✅ Codex обновлён.\n<pre>{output}</pre>",
+        "ui.codex_update_failed": "❌ Обновление Codex упало ({status}).\n<pre>{output}</pre>",
+        "ui.codex_update_already_running": "Обновление Codex уже идёт.",
+        "ui.codex_update_active_sessions": (
+            "⚠️ Обновление Codex пропущено: сначала останови активные Codex-сессии через /kill."
+        ),
+        "ui.codex_update_cooldown": "Автообновление Codex пропущено: cooldown ещё активен.",
         # --- UI: tail / tui feature strings (Wave 3 tmux-tui-mode) ----
         "ui.tail_unavailable": (
             "⚠️ Нет активной tmux-сессии — /tui недоступен."
@@ -315,6 +359,12 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⚠️ Сообщение НЕ отправлено — CC ждёт действие в модальном диалоге.\n"
             "Твоё сообщение: <code>{prompt}</code>\n"
             "Закрой диалог (Esc / выбери пункт) и отправь заново."
+        ),
+        "ui.delivery_unconfirmed_header": (
+            "⚠️ Не удалось подтвердить отправку — сообщение уже может находиться "
+            "в поле ввода Codex.\n"
+            "Твоё сообщение: <code>{prompt}</code>\n"
+            "Открой /tui и проверь поле ввода. Пока не отправляй сообщение повторно."
         ),
         "ui.modal_idle_detected": (
             "⚠️ CC ждёт действие в модальном диалоге.\n"
@@ -372,6 +422,16 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.stream_mode_invalid": "Неизвестный режим",
         "ui.stream_mode_not_in_forum": "⚠️ /stream работает только внутри форум-топиков.",
         "ui.stream_mode_write_failed": "Не удалось записать конфиг",
+        "ui.claude_no_text": "Claude завершил ход без текстового ответа.",
+        "ui.claude_stop_sequence_no_text": (
+            "Claude завершил ход по стоп-последовательности без текстового ответа."
+        ),
+        "ui.claude_limit_no_text": "Claude достиг лимита вывода без текстового ответа.",
+        "ui.claude_context_no_text": "Claude достиг лимита контекста без текстового ответа.",
+        "ui.claude_refused_no_text": "Claude отказался отвечать.",
+        "ui.claude_unknown_completion": ("Claude завершил предыдущий ход в неизвестном формате."),
+        "ui.claude_limit_note": "\n\n⚠️ Ответ оборван из-за лимита вывода.",
+        "ui.claude_context_note": "\n\n⚠️ Ответ оборван из-за лимита контекста.",
         "ui.session_switched": "🔄 сессия: {sid}",
         "ui.session_switched_engine": "🔄 сессия {engine}: {sid}",
         "ui.resume_picker_caption_hdr": "Сессии для <code>{cwd}</code>, страница {page}/{total}",

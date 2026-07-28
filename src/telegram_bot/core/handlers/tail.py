@@ -91,13 +91,45 @@ _SEND_KEYS_MAP: dict[str, list[str]] = {
     "cO": ["C-o"],
     "cR": ["C-r"],
     "cT": ["C-t"],
+    "cB": ["C-b"],
     "num0": ["0"],
     "num1": ["1"],
     "num2": ["2"],
     "num3": ["3"],
+    "num4": ["4"],
+    "num5": ["5"],
+    "num1e": ["1", "Enter"],
+    "num2e": ["2", "Enter"],
+    "num3e": ["3", "Enter"],
+    "num4e": ["4", "Enter"],
+    "num5e": ["5", "Enter"],
+    "keyD": ["d"],
+    "keyY": ["y"],
+    "keyN": ["n"],
+    "spc": ["Space"],
 }
 
-_RECOVERY_TAIL_ACTIONS = {"ent", "num0", "num1", "num2", "num3"}
+# Actions that can submit a modal / unblock the TUI — after sending them the
+# handler starts a recovery tail so resulting output reaches Telegram without
+# waiting for the next user message. Navigation (arrows) and toggles
+# (Space, C-*) are excluded on purpose.
+_RECOVERY_TAIL_ACTIONS = {
+    "ent",
+    "num0",
+    "num1",
+    "num2",
+    "num3",
+    "num4",
+    "num5",
+    "num1e",
+    "num2e",
+    "num3e",
+    "num4e",
+    "num5e",
+    "keyD",
+    "keyY",
+    "keyN",
+}
 
 
 def _capture_pane_cmd(session_name: str) -> list[str]:
@@ -206,6 +238,7 @@ async def _handle_tail_entry(
         return
 
     raw_pane = result.stdout or ""
+    tmux_manager.observe_tui_pane(key, epoch, raw_pane)
     pane_html = _format_pane_html(raw_pane)
     keyboard = build_tail_keyboard(
         session_id=epoch,
@@ -293,10 +326,10 @@ async def handle_tail_callback(callback: CallbackQuery, tmux_manager: TmuxManage
     # close: delete the whole /tui post (snapshot + keyboard), no send-keys.
     # The prior behaviour was to drop only the reply markup and leave the
     # <pre> pane snapshot in the chat — which piles up noise over a working
-    # day. The modal watchdog's dedup (`_last_modal_pane`) remembers the
-    # pane we already alerted on, so deleting the post does NOT un-silence
-    # the watchdog on a still-open modal: until the pane actually changes,
-    # no new alert fires. `edit_reply_markup(None)` could be used instead
+    # day. The modal watchdog's lifecycle latch remembers that this open
+    # modal already produced an alert, so deleting the post does NOT
+    # un-silence the watchdog: until the modal closes, no new alert fires.
+    # `edit_reply_markup(None)` could be used instead
     # as a soft undo, but the user prefers a clean chat.
     if action == "close":
         with contextlib.suppress(Exception):
@@ -338,6 +371,9 @@ async def handle_tail_callback(callback: CallbackQuery, tmux_manager: TmuxManage
         await callback.answer(t("ui.tail_keyboard_stale"), show_alert=True)
         return
 
+    if action in _RECOVERY_TAIL_ACTIONS:
+        await tmux_manager.ensure_recovery_tail(key)
+
     await asyncio.sleep(_SEND_KEYS_SETTLE_SEC)
 
     await _rerender(
@@ -349,8 +385,6 @@ async def handle_tail_callback(callback: CallbackQuery, tmux_manager: TmuxManage
         thread_id=parsed.thread_id,
         kind=parsed.kind,
     )
-    if action in _RECOVERY_TAIL_ACTIONS:
-        await tmux_manager.ensure_recovery_tail(key)
     logger.info("TUI_IO: /tui callback action=%s session=%s", action, session_name)
     await callback.answer()
 
@@ -400,6 +434,7 @@ async def _rerender(
         return
 
     raw_pane = result.stdout or ""
+    tmux_manager.observe_tui_pane((chat_id, thread_id), epoch, raw_pane)
 
     if kind == KIND_MODAL:
         text, keyboard = render_modal_idle_alert(

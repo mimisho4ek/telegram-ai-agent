@@ -19,6 +19,7 @@ _PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
 _MODE_PROMPT_FALLBACKS: dict[str, tuple[str, ...]] = {
     "task": ("task.md", "task-manager.md", "default.md"),
     "knowledge": ("knowledge.md", "default.md"),
+    "assistant": ("assistant.md", "free.md", "default.md"),
     "free": ("free.md", "default.md"),
     "project": ("project.md", "default.md"),
     "blog": ("blog.md", "default.md"),
@@ -41,12 +42,13 @@ def _read_prompt_with_fallback(mode: str) -> str:
 # cheap. Public builds may ship only default.md and task-manager.md.
 TASK_MODE_PROMPT = _read_prompt_with_fallback("task")
 KNOWLEDGE_MODE_PROMPT = _read_prompt_with_fallback("knowledge")
+ASSISTANT_MODE_PROMPT = _read_prompt_with_fallback("assistant")
 FREE_MODE_PROMPT = _read_prompt_with_fallback("free")
 PROJECT_MODE_PROMPT = _read_prompt_with_fallback("project")
 BLOG_MODE_PROMPT = _read_prompt_with_fallback("blog")
 MEETING_MODE_PROMPT = _read_prompt_with_fallback("meeting")
 
-Mode = Literal["task", "knowledge", "free", "project", "blog", "meeting"]
+Mode = Literal["task", "knowledge", "assistant", "free", "project", "blog", "meeting"]
 
 # Default mode used when no per-topic mode is configured (auto-registered topics).
 DEFAULT_MODE: Mode = "free"
@@ -74,6 +76,7 @@ KNOWLEDGE_MODE_TOOLS = (
 FREE_MODE_TOOLS = (
     f"Skill,{_BOT_MCP_TOOLS},{_CONTEXT7_MCP_TOOLS},Read,Write,Edit,Grep,Glob,Bash,Agent"
 )
+ASSISTANT_MODE_TOOLS = FREE_MODE_TOOLS
 PROJECT_MODE_TOOLS = (
     f"{_BOT_MCP_TOOLS},{_CONTEXT7_MCP_TOOLS},Read,Write,Edit,Grep,Glob,Bash,Agent,Skill"
 )
@@ -89,6 +92,7 @@ MEETING_MODE_TOOLS = "mcp__meetings__create_meeting,mcp__contacts__resolve_conta
 _MODE_TOOLS: dict[str, str] = {
     "task": TASK_MODE_TOOLS,
     "knowledge": KNOWLEDGE_MODE_TOOLS,
+    "assistant": ASSISTANT_MODE_TOOLS,
     "free": FREE_MODE_TOOLS,
     "project": PROJECT_MODE_TOOLS,
     "blog": BLOG_MODE_TOOLS,

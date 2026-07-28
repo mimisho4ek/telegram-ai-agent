@@ -197,11 +197,10 @@ topic can have its own runtime:
       "type": "project",
       "mode": "free",
       "cwd": "/absolute/path/to/project",
-      "mcp_config": "/absolute/path/to/project/.mcp.json",
+      "mcp_config": null,
       "stream_mode": "live",
       "exec_mode": "tmux",
-      "engine": "codex",
-      "model": null
+      "engine": "codex"
     }
   }
 }
@@ -211,28 +210,34 @@ Fields:
 
 - `type`: `assistant` for generic chats, `project` for project-bound topics.
 - `mode`: public prompt mode. Use `free` as the standard project/general prompt.
-  The bundled `task` mode is only an example of a second prompt mode; users can
-  replace it with their own prompt file and topic mode if they want a different
-  workflow.
+  The bundled `task` mode is an example of a replaceable second workflow.
+  No-code customization replaces `task-manager.md` while keeping `mode=task`;
+  adding a mode name requires runtime resolver and tool-policy code changes.
 
 Both public prompt modes have the same generic bot MCP send-tool whitelist:
-`send_message`, `send_image`, and `send_document`.
+`send_message`, `send_image`, `send_image_gallery`, and `send_document`.
 - `cwd`: absolute working directory for the agent; `null` uses `DEFAULT_CWD`.
-- `mcp_config`: absolute MCP config path; `null` uses the generated bot MCP config.
+- `mcp_config`: use `null` by default so the bot generates its send-tool MCP
+  runtime. Use an existing absolute project MCP config only on explicit request
+  after checking it for secrets and private dependencies. Extra servers in that
+  file are separate from the four bundled `bot` send tools and must be
+  supported by the selected engine and its tool policy.
 - `stream_mode`: `verbose`, `live`, or `minimal`.
 - `exec_mode`: `subprocess` for one-off assistant tasks where the user does
   not need a persistent agent process, or `tmux` for full development sessions
   with persistent context, TUI snapshots, `/resume`, and `/tui`.
 - `engine`: `claude` or `codex`.
-- `model`: optional provider model override, or `null`.
+- `models`: optional per-engine overrides keyed by `claude` and/or `codex`.
+  The active engine's entry wins over the legacy `model` fallback, and
+  manual `/engine` changes preserve the map. During automatic missing-CLI
+  fallback, the first fallback request uses the provider default; the saved
+  per-engine override applies from the next topic-config lookup.
 
 For creating or wiring forum topics, use the `topic-setup` skill in this repo.
 `topic-setup` can create a Telegram forum topic when the bot token is available
 and the bot is an admin with topic rights, then update `topic_config.json` with
-the chosen `cwd`, engine, execution mode, stream mode, and optional model.
-Do not document extra public prompt modes unless the corresponding public prompt
-files are intentionally added in the same release.
-
+the chosen `cwd`, engine, execution mode, stream mode, and optional model
+overrides.
 ## Commands
 
 - `/start`: show the basic keyboard and verify the bot responds.
@@ -247,12 +252,20 @@ files are intentionally added in the same release.
   `/resume`, and `/tui`.
 - `/engine`: choose Claude Code or Codex for the current forum topic. It resets
   the active session when switching.
+- `/codex_update`: update the Codex CLI manually; it bypasses the automatic
+  cooldown but refuses to run during another bot-managed update in this process
+  or a bot-managed active Codex session. `/codex_update status` shows the last
+  redacted result.
 - `/stream`: choose progress delivery. `verbose` sends many event messages,
-  `live` edits one progress buffer, `minimal` focuses on final answers.
+  `live` edits one progress buffer, and `minimal` suppresses tool/status noise.
+  Human-readable intermediate updates remain separate in every mode.
 - `/resume`: in tmux mode, pick a saved Claude/Codex session for the topic cwd.
 - `/tui`: show a current tmux TUI snapshot with controls.
 - `/tail`: alias for `/tui`.
 - `/kill`: stop the active tmux session and free resources.
+- `/recycle`: restart a stuck tmux runtime while preserving resumable context
+  when possible.
+- `/mcpstatus`: show redacted MCP process diagnostics for the current topic.
 
 When unsure: use `/mode` → regular for short requests, `/mode` → tmux for real
 coding tasks, `/stream` → live for daily use, and `/kill` when an old tmux

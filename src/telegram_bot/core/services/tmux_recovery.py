@@ -149,6 +149,7 @@ def build_resume_startup_cmd(
             mode=mode,
             mcp_config=mcp_config or "",
             resume_session_id=session_id,
+            model=model,
         ),
     )
 
@@ -308,7 +309,10 @@ def restore_all(
 
 async def resume_tails(
     manager: TmuxManager,
-    on_event_factory: Callable[[ChannelKey], Callable[[StreamEvent], Awaitable[None] | None]],
+    on_event_factory: Callable[
+        [ChannelKey],
+        Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
+    ],
 ) -> None:
     """Start recovery tails for all alive sessions on bot startup.
 
@@ -345,7 +349,7 @@ async def run_recovery_tail(
     channel_key: ChannelKey,
     state: TmuxSessionState,
     output_path: Path,
-    on_event: Callable[[StreamEvent], Awaitable[None] | None],
+    on_event: Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
     cancel_event: asyncio.Event,
 ) -> None:
     """Drain pending output and continue tailing until CC finishes.
@@ -355,23 +359,19 @@ async def run_recovery_tail(
     This handles the case where CC is mid-Bash-command at restart and
     hasn't written to the transcript yet when resume_tails runs.
 
-    Wraps on_event to clear `manager._is_processing` on response delivery
-    (result / result_message / text). send_direct sets the flag for every
-    prompt routed through an active recovery tail; without this clear the
-    flag stays True forever (the recovery on_event in __main__ never touches
-    it, and the Claude TUI transcript has no terminal event), permanently
-    busy-rejecting /mode, /engine, and /recycle.
+    Wraps on_event so normalized turn_start/turn_end events own the processing
+    flag. Intermediate text and final delivery do not clear another turn.
     """
 
-    async def _on_event_clearing(event: StreamEvent) -> None:
+    async def _on_event_clearing(event: StreamEvent) -> bool | None:
         if event.type == "result":
-            manager._is_processing[channel_key] = False
-            return
+            manager.clear_processing(channel_key)
+            return None
         ret = on_event(event)
         if asyncio.iscoroutine(ret):
-            await ret
-        if event.type in ("result_message", "text"):
-            manager._is_processing[channel_key] = False
+            ret = await ret
+        manager.handle_turn_event(channel_key, event)
+        return cast(bool | None, ret)
 
     try:
         _result_text, _new_session_id = await manager._tail_until_done(
@@ -404,5 +404,7 @@ async def run_recovery_tail(
             # canceller (send_stream / cancel / clear_context) owns the flag:
             # send_stream sets it True for the next prompt right before
             # cancelling this tail, and popping it here would erase that.
-            manager._is_processing.pop(channel_key, None)
-        await manager.close_buffer(channel_key)
+            manager.clear_processing(channel_key)
+        # A new normal tail may already have queued its own placeholder before
+        # cancelling this recovery tail. Preserve that candidate.
+        await manager.close_active_buffer(channel_key)

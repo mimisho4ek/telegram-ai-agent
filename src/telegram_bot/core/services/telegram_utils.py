@@ -65,14 +65,14 @@ async def send_placeholder(
 class SendOutcome:
     """Result of a send attempt through send_html_with_fallback.
 
-    message_id is non-None only on a successful delivery (HTML, retried
-    HTML, or plain-text fallback). fatal=True signals the bot was blocked
-    by the user (TelegramForbiddenError) — callers that iterate over
-    multiple sends should stop further attempts.
+    ``message_id`` is non-None when at least one physical send succeeded.
+    ``complete`` is False when a logical multi-part message was only partly
+    delivered. ``fatal`` signals that callers should stop further attempts.
     """
 
     message_id: int | None
     fatal: bool = False
+    complete: bool = True
 
 
 async def send_html_with_fallback(

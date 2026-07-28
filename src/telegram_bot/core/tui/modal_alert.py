@@ -1,12 +1,12 @@
-"""Render the Telegram alert shown when send_direct is blocked by a modal.
+"""Render the Telegram alert shown when send_direct cannot confirm delivery.
 
-Pure function — no I/O. Returns the (HTML text, inline keyboard) pair
+Pure function — no I/O. Returns the (HTML text, optional inline keyboard) pair
 ready to pass to `aiogram.Bot.send_message(parse_mode="HTML", reply_markup=...)`.
 
-The inline keyboard is the same one built by `/tui`: arrow keys, Enter,
-Esc/Esc-Esc, digits, refresh, close. Reusing it means the user already
-knows how to operate this panel — it's the same tool they've used for
-manual TUI control.
+Ordinary modal alerts include the same keyboard built by `/tui`: arrow keys,
+Enter, Esc/Esc-Esc, digits, refresh, close. Unknown-delivery alerts omit the
+keyboard so a refresh cannot replace the safety warning with ordinary modal
+copy; the alert tells the user to open `/tui` explicitly.
 
 Message layout:
   <header>                   — i18n'd, names the blocked prompt (truncated)
@@ -40,6 +40,12 @@ _PRE_WRAPPER_AND_SEP_CHARS = len("<pre>") + len("</pre>") + len("\n\n")
 # an upper ceiling, the real cap is recomputed dynamically vs. the header.
 _PANE_MAX_CHARS_CEILING = 3900
 _TRUNCATION_PREFIX = "... (truncated)\n"
+_DELIVERY_UNCONFIRMED_REASONS = frozenset(
+    {
+        "paste_not_landed_after_retries",
+        "paste_visibility_lost_before_enter",
+    }
+)
 
 
 def _format_prompt_preview(prompt: str) -> str:
@@ -120,25 +126,35 @@ def render_modal_alert(
     session_id: str,
     chat_id: int,
     thread_id: int | None,
-) -> tuple[str, InlineKeyboardMarkup]:
+    reason: str = "unspecified",
+) -> tuple[str, InlineKeyboardMarkup | None]:
     """Build the alert payload.
 
     Args:
-      prompt: the user message that was not sent.
+      prompt: the user message whose delivery was blocked or unconfirmed.
       pane: raw `tmux capture-pane -p` output (unescaped).
       session_id: full UUID4 — its first 8 hex chars become the keyboard
         epoch so stale presses after a session swap are rejected.
       chat_id, thread_id: Telegram routing, pinned into callback_data.
+      reason: send failure shape; unconfirmed Codex paste uses safer copy
+        that tells the user to inspect `/tui` before resending.
 
     Returns:
-      (html_text, keyboard) — ready for send_message(parse_mode="HTML").
+      (html_text, optional_keyboard) — ready for
+      send_message(parse_mode="HTML").
     """
-    header = t("ui.modal_blocked_header", prompt=_format_prompt_preview(prompt))
-    text = _assemble(header, pane)
-    keyboard = build_tail_keyboard(
-        session_id=session_id,
-        chat_id=chat_id,
-        thread_id=thread_id,
-        kind=KIND_MODAL,
+    delivery_unconfirmed = reason in _DELIVERY_UNCONFIRMED_REASONS
+    header_key = (
+        "ui.delivery_unconfirmed_header" if delivery_unconfirmed else "ui.modal_blocked_header"
     )
+    header = t(header_key, prompt=_format_prompt_preview(prompt))
+    text = _assemble(header, pane)
+    keyboard = None
+    if not delivery_unconfirmed:
+        keyboard = build_tail_keyboard(
+            session_id=session_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            kind=KIND_MODAL,
+        )
     return text, keyboard

@@ -22,7 +22,10 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from telegram_bot.core.services.cc_events import StreamEvent, _tool_status
-from telegram_bot.core.services.codex_mcp import build_codex_mcp_config_args
+from telegram_bot.core.services.codex_mcp import (
+    build_codex_mcp_config_args,
+    discover_codex_mcp_server_names,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +43,64 @@ def _use_codex_bot_home() -> bool:
     return (
         not _env_truthy("TELEGRAM_CODEX_SHARED_HOME") and (_CODEX_BOT_HOME / "config.toml").exists()
     )
+
+
+def _is_safe_owned_executable(path: Path) -> bool:
+    """Return whether *path* is an executable owned only by the service user."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    if not path.is_file() or not os.access(path, os.X_OK):
+        return False
+    return stat.st_uid == os.getuid() and stat.st_mode & 0o022 == 0
+
+
+def _configured_claude_binary() -> Path | None:
+    configured = os.getenv("TELEGRAM_CLAUDE_BIN") or os.getenv("CLAUDE_BINARY_PATH")
+    if not configured:
+        return None
+    return Path(configured).expanduser()
+
+
+def _standalone_claude_path() -> Path:
+    return Path.home() / ".local" / "bin" / "claude"
+
+
+def _legacy_claude_path() -> Path:
+    return Path.home() / ".npm-global" / "bin" / "claude"
+
+
+def claude_binary() -> str:
+    """Return a safe absolute Claude CLI path for service and cron processes."""
+    configured = _configured_claude_binary()
+    if configured is not None:
+        if configured.is_absolute() and _is_safe_owned_executable(configured):
+            return str(configured)
+        raise RuntimeError(f"Unsafe configured Claude binary: {configured}")
+
+    candidates = [_standalone_claude_path()]
+    if found := shutil.which("claude"):
+        candidates.append(Path(found))
+    candidates.append(_legacy_claude_path())
+
+    for candidate in candidates:
+        if candidate.is_absolute() and _is_safe_owned_executable(candidate):
+            return str(candidate)
+
+    # Fail with a deterministic path rather than relying on the service PATH.
+    return str(_standalone_claude_path())
+
+
+def safe_claude_binary() -> str | None:
+    """Resolve Claude or return ``None`` when no safe executable is available."""
+    try:
+        candidate = Path(claude_binary())
+    except RuntimeError:
+        return None
+    if candidate.is_absolute() and _is_safe_owned_executable(candidate):
+        return str(candidate)
+    return None
 
 
 def _ensure_codex_global_skill_links() -> None:
@@ -83,18 +144,108 @@ def engine_display_name(engine: str) -> str:
 
 
 def _codex_tui_prefix() -> list[str]:
-    """Use the bot's lightweight Codex home when it is provisioned.
+    """Select the Codex home configured for bot processes.
 
-    Bot TUI sessions pass topic-scoped MCP servers through CLI overrides. A
-    large or broken user-level ~/.codex/config.toml should not block fresh chat
-    creation, so production provides ~/.codex-bot with shared auth and minimal
-    config. Operators can temporarily opt into the regular home with
-    ``TELEGRAM_CODEX_SHARED_HOME=1``.
+    The production launch config sets ``TELEGRAM_CODEX_SHARED_HOME=1`` so bot
+    sessions use the regular ~/.codex home. The isolated ~/.codex-bot behavior
+    remains available when that flag is absent.
     """
+    return codex_env_prefix()
+
+
+def _configured_codex_binary() -> Path | None:
+    configured = os.getenv("TELEGRAM_CODEX_BIN") or os.getenv("CODEX_BINARY_PATH")
+    if not configured:
+        return None
+    return Path(configured).expanduser()
+
+
+def _standalone_codex_path() -> Path:
+    return Path.home() / ".local" / "bin" / "codex"
+
+
+def codex_npm_prefix() -> Path:
+    """Return the legacy npm global prefix used only as a last-resort fallback."""
+    configured = os.getenv("CODEX_NPM_PREFIX") or os.getenv("TELEGRAM_CODEX_NPM_PREFIX")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".npm-global"
+
+
+# App vars agent sessions need at runtime (e.g. vault-link-tg requires
+# CADDY_DOMAIN). Secrets/tokens stay excluded: MCP servers load them
+# themselves via their start.sh.
+_CODEX_APP_ENV = (
+    "CADDY_DOMAIN",
+    "VAULT_PATH",
+    "VAULT_ROOTS",
+    "PROJECT_ROOT",
+)
+
+_CODEX_ENV_ALLOWLIST = {
+    "HOME",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "COLORTERM",
+    "NO_COLOR",
+    "TERM",
+    *_CODEX_APP_ENV,
+}
+
+
+def codex_process_env(
+    *,
+    codex_bin: str | Path | None = None,
+    base_env: dict[str, str] | None = None,
+    minimal: bool = True,
+) -> dict[str, str]:
+    """Build a constrained process env for bot-spawned Codex commands."""
+    source = os.environ if base_env is None else base_env
+    if minimal:
+        env = {key: value for key, value in source.items() if key in _CODEX_ENV_ALLOWLIST}
+    else:
+        env = dict(source)
+    binary = Path(codex_bin).expanduser() if codex_bin is not None else Path(CODEX_ADAPTER.binary())
+    bin_dir = binary.expanduser().parent
+    current_path = env.get("PATH", os.defpath)
+    path_parts = [str(bin_dir), *(part for part in current_path.split(os.pathsep) if part)]
+    env["PATH"] = os.pathsep.join(dict.fromkeys(path_parts))
+    env.pop("NPM_CONFIG_PREFIX", None)
+    env.setdefault("HOME", str(Path.home()))
+    env.setdefault("TERM", "xterm-256color")
     if _use_codex_bot_home():
         _ensure_codex_global_skill_links()
-        return ["env", f"CODEX_HOME={_CODEX_BOT_HOME}"]
-    return []
+        env["CODEX_HOME"] = str(_CODEX_BOT_HOME)
+    else:
+        env.pop("CODEX_HOME", None)
+    return env
+
+
+def codex_env_prefix(*, codex_bin: str | Path | None = None) -> list[str]:
+    env = codex_process_env(codex_bin=codex_bin)
+    keys = ["CODEX_HOME", "PATH"]
+    inherited_keys = [
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "COLORTERM",
+        "NO_COLOR",
+        "TERM",
+        *_CODEX_APP_ENV,
+    ]
+    ordered_keys = [*inherited_keys, *keys]
+    return ["env", "-i", *(f"{key}={env[key]}" for key in ordered_keys if key in env)]
 
 
 def _codex_sessions_root(home: Path | None = None) -> Path:
@@ -111,6 +262,7 @@ class ExecCommand:
     cwd: str
     stdin_text: str | None = None
     output_last_message_path: Path | None = None
+    env: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -353,32 +505,41 @@ class CodexAdapter:
     def binary(self) -> str:
         """Return an executable Codex CLI path that works in service processes.
 
-        The bot service may not inherit the interactive shell PATH, while
-        npm-global commonly installs Codex under ~/.npm-global/bin. Using the
-        absolute path prevents tmux from opening and immediately closing with
-        "codex: command not found", which otherwise looks like a TUI readiness
-        timeout.
+        The bot service may not inherit the interactive shell PATH. Prefer the
+        standalone installer path (or an explicit operator override), and keep
+        the old npm-global location only as a legacy fallback.
         """
-        fallback = Path.home() / ".npm-global" / "bin" / "codex"
-        if self._is_safe_binary(fallback):
-            return str(fallback)
+        configured = _configured_codex_binary()
+        if configured is not None:
+            if configured.is_absolute() and self._is_safe_binary(configured):
+                return str(configured)
+            raise RuntimeError(f"Unsafe configured Codex binary: {configured}")
+
+        candidates = [
+            _standalone_codex_path(),
+            _CODEX_HOME / "packages" / "standalone" / "current" / "bin" / "codex",
+        ]
         if found := shutil.which("codex"):
-            candidate = Path(found)
+            candidates.append(Path(found))
+        candidates.append(codex_npm_prefix() / "bin" / "codex")
+
+        for candidate in candidates:
             if candidate.is_absolute() and self._is_safe_binary(candidate):
                 return str(candidate)
-        # Return the explicit expected path so process spawn fails loudly
+
+        # Return the expected standalone path so process spawn fails loudly
         # instead of searching a service PATH that may not contain Codex.
-        return str(fallback)
+        return str(_standalone_codex_path())
+
+    def safe_binary(self) -> str | None:
+        candidate = Path(self.binary())
+        if candidate.is_absolute() and self._is_safe_binary(candidate):
+            return str(candidate)
+        return None
 
     @staticmethod
     def _is_safe_binary(path: Path) -> bool:
-        try:
-            stat = path.stat()
-        except OSError:
-            return False
-        if not path.is_file() or not os.access(path, os.X_OK):
-            return False
-        return stat.st_uid == os.getuid() and stat.st_mode & 0o022 == 0
+        return _is_safe_owned_executable(path)
 
     def parse_exec_event(self, raw: str) -> ExecParseResult:
         data = _load_json(raw)
@@ -460,10 +621,15 @@ class CodexAdapter:
     def build_tui_start(
         self, *, cwd: str, model: str | None = None, mcp_config: str | None = None
     ) -> list[str]:
+        codex_home = _CODEX_BOT_HOME if _use_codex_bot_home() else _CODEX_HOME
+        inherited_servers = discover_codex_mcp_server_names(cwd, codex_home=codex_home)
         cmd = [
             *_codex_tui_prefix(),
             self.binary(),
-            *build_codex_mcp_config_args(mcp_config, ignore_user_config=False),
+            *build_codex_mcp_config_args(
+                mcp_config,
+                inherited_server_names=inherited_servers,
+            ),
             "--no-alt-screen",
             "--dangerously-bypass-approvals-and-sandbox",
             "--cd",
@@ -481,11 +647,16 @@ class CodexAdapter:
         model: str | None = None,
         mcp_config: str | None = None,
     ) -> list[str]:
+        codex_home = _CODEX_BOT_HOME if _use_codex_bot_home() else _CODEX_HOME
+        inherited_servers = discover_codex_mcp_server_names(cwd, codex_home=codex_home)
         cmd = [
             *_codex_tui_prefix(),
             self.binary(),
             "resume",
-            *build_codex_mcp_config_args(mcp_config, ignore_user_config=False),
+            *build_codex_mcp_config_args(
+                mcp_config,
+                inherited_server_names=inherited_servers,
+            ),
             session_id,
             "--no-alt-screen",
             "--dangerously-bypass-approvals-and-sandbox",
@@ -708,15 +879,124 @@ class CodexAdapter:
         raise TimeoutError("Codex TUI transcript not found")
 
 
+class CodexTranscriptParser:
+    """Per-tail Codex parser that attaches events to ``turn_context.turn_id``."""
+
+    def __init__(self, adapter: CodexAdapter | None = None) -> None:
+        self._adapter = adapter or CODEX_ADAPTER
+        self._turn_id: str | None = None
+        self._final_seen = False
+        self._completed_turn_id: str | None = None
+        self._completed_final_seen = False
+
+    @property
+    def current_turn_id(self) -> str | None:
+        return self._turn_id
+
+    @staticmethod
+    def is_turn_boundary(raw: str) -> bool:
+        return CodexTranscriptParser.turn_boundary_id(raw) is not None
+
+    @staticmethod
+    def turn_boundary_id(raw: str) -> str | None:
+        data = _load_json(raw)
+        if data is None or data.get("type") != "turn_context":
+            return None
+        payload = data.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        turn_id = payload.get("turn_id")
+        return turn_id if isinstance(turn_id, str) and turn_id else None
+
+    def parse(self, raw: str) -> TuiParseResult:
+        data = _load_json(raw)
+        if data is None:
+            return TuiParseResult([])
+        payload = data.get("payload")
+
+        if data.get("type") == "turn_context" and isinstance(payload, dict):
+            raw_turn_id = payload.get("turn_id")
+            if not isinstance(raw_turn_id, str) or not raw_turn_id:
+                return TuiParseResult([])
+            if raw_turn_id == self._completed_turn_id:
+                return TuiParseResult([])
+            if raw_turn_id == self._turn_id:
+                return TuiParseResult([])
+            events: list[StreamEvent] = []
+            if self._turn_id is not None:
+                events.append(StreamEvent("turn_end", "", turn_id=self._turn_id))
+            self._turn_id = raw_turn_id
+            self._final_seen = False
+            self._completed_turn_id = None
+            self._completed_final_seen = False
+            events.append(StreamEvent("turn_start", "", turn_id=raw_turn_id))
+            return TuiParseResult(events)
+
+        if (
+            data.get("type") == "event_msg"
+            and isinstance(payload, dict)
+            and payload.get("type") == "task_complete"
+        ):
+            raw_turn_id = payload.get("turn_id")
+            completed_id = raw_turn_id if isinstance(raw_turn_id, str) else self._turn_id
+            if completed_id is None:
+                return TuiParseResult([])
+            if self._turn_id is not None and completed_id != self._turn_id:
+                logger.warning(
+                    "Ignoring stale Codex task_complete turn_id=%s active_turn_id=%s",
+                    completed_id,
+                    self._turn_id,
+                )
+                return TuiParseResult([])
+            self._completed_turn_id = completed_id
+            self._completed_final_seen = self._final_seen
+            self._turn_id = None
+            return TuiParseResult(
+                [StreamEvent("turn_end", "", turn_id=completed_id)],
+                done=False,
+            )
+
+        parsed = self._adapter.parse_tui_event(raw)
+        normalized_events: list[StreamEvent] = []
+        event_turn_id = self._turn_id or self._completed_turn_id
+        for event in parsed.events:
+            if event.type == "result":
+                continue
+            if event.type == "result_message":
+                final_seen = (
+                    self._final_seen if self._turn_id is not None else self._completed_final_seen
+                )
+                if final_seen:
+                    logger.warning(
+                        "Ignoring duplicate Codex final_answer turn_id=%s",
+                        event_turn_id,
+                    )
+                    continue
+                if self._turn_id is not None:
+                    self._final_seen = True
+                else:
+                    self._completed_final_seen = True
+            event.turn_id = event_turn_id
+            normalized_events.append(event)
+        return TuiParseResult(
+            normalized_events,
+            session_id=parsed.session_id,
+            done=False,
+        )
+
+
 CODEX_ADAPTER = CodexAdapter()
 
 
 def is_engine_available(engine: str) -> bool:
     """Return whether the provider CLI can be spawned by the current process."""
     if engine == "claude":
-        return shutil.which("claude") is not None
+        return safe_claude_binary() is not None
     if engine == "codex":
-        return CODEX_ADAPTER._is_safe_binary(Path(CODEX_ADAPTER.binary()))
+        try:
+            return CODEX_ADAPTER._is_safe_binary(Path(CODEX_ADAPTER.binary()))
+        except RuntimeError:
+            return False
     return False
 
 

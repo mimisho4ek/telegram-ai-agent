@@ -7,8 +7,8 @@ import contextlib
 import html
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError
@@ -52,6 +52,7 @@ __all__ = [
     "send_streaming_response",
     "send_to_tmux_if_active",
     "split_html_message",
+    "stream_event_action",
 ]
 
 # Default when topic_config is not wired in (standalone / legacy tests).
@@ -60,6 +61,15 @@ _DEFAULT_CALLER_STREAM_MODE: StreamMode = "verbose"
 
 # Per-key lock — see ensure_exec_mode_ready docstring.
 _lazy_start_locks: dict[ChannelKey, asyncio.Lock] = {}
+
+DeliveryAction = Literal[
+    "drop",
+    "separate_progress",
+    "buffer_progress",
+    "final",
+    "turn_start",
+    "turn_end",
+]
 
 
 def _resolve_stream_mode(
@@ -71,6 +81,25 @@ def _resolve_stream_mode(
         return _DEFAULT_CALLER_STREAM_MODE
     thread_id = channel_key[1]
     return topic_config.get_topic(thread_id).stream_mode
+
+
+def stream_event_action(mode: StreamMode | str, event: StreamEvent) -> DeliveryAction:
+    """Return the provider-neutral delivery decision for one normalized event."""
+    if event.type == "turn_start":
+        return "turn_start"
+    if event.type == "turn_end" or event.type == "result":
+        return "turn_end"
+    if event.type == "result_message":
+        return "final"
+    if event.type == "text":
+        return "separate_progress"
+    if event.type != "status":
+        return "drop"
+    if mode == "minimal":
+        return "drop"
+    if mode == "live":
+        return "buffer_progress"
+    return "separate_progress"
 
 
 _MAX_REPLY_CONTEXT_LEN = 2000
@@ -127,10 +156,9 @@ async def send_to_tmux_if_active(
     Returns True if dispatched to tmux (caller should return immediately),
     False if not in active tmux tail (caller should enqueue normally).
 
-    Always creates a new "Thinking..." placeholder and rotates the live
-    buffer, even when CC is already processing — so status events for
-    subsequent prompts appear in a fresh message rather than the original.
-    N rapid messages produce N placeholders; each idles until CC reaches it.
+    Creates a "Thinking..." placeholder only while the provider is idle.
+    A prompt accepted during an active turn is a clarification of that turn,
+    so it keeps the current live buffer instead of creating an orphan candidate.
     """
     msg_id = source_msg.message_id
     if not (tmux_manager.is_active(key) and tmux_manager.is_tailing(key)):
@@ -148,20 +176,21 @@ async def send_to_tmux_if_active(
         msg_id,
     )
 
-    # Resolve stream_mode for this channel from topic_config on tmux_manager
-    # (wired at startup). Missing wiring → legacy verbose behavior.
     stream_mode = _resolve_stream_mode(
         tmux_manager.get_topic_config(),  # type: ignore[arg-type]
         key,
     )
+    thinking_msg = None
+    thinking_text = t("ui.thinking")
+    if not tmux_manager.is_processing(key):
+        cmd = prompt.split()[0] if prompt.startswith("/") else None
+        thinking_text = t("ui.running_command", command=cmd) if cmd else t("ui.thinking")
+        thinking_msg = await send_placeholder(
+            lambda: source_msg.answer(thinking_text, disable_notification=True),
+            label="thinking placeholder (tmux)",
+        )
 
-    cmd = prompt.split()[0] if prompt.startswith("/") else None
-    thinking_text = t("ui.running_command", command=cmd) if cmd else t("ui.thinking")
-    thinking_msg = await send_placeholder(
-        lambda: source_msg.answer(thinking_text, disable_notification=True),
-        label="thinking placeholder (tmux)",
-    )
-
+    queued_buffer = False
     if stream_mode == "live" and tmux_manager.live_buffer_available() and thinking_msg is not None:
         bot = tmux_manager.get_live_bot()
         new_buffer = LiveStatusBuffer(
@@ -171,8 +200,10 @@ async def send_to_tmux_if_active(
             initial_message_id=thinking_msg.message_id,
             header_text=thinking_text,
         )
-        # set_buffer closes the previous buffer atomically, covering the prior thinking page.
-        await tmux_manager.set_buffer(key, new_buffer)
+        # The incoming Telegram message is only a candidate owner. The active
+        # progress changes when the transcript confirms the next provider turn.
+        await tmux_manager.queue_buffer(key, new_buffer)
+        queued_buffer = True
 
     delivered = await tmux_manager.send_direct(key, prompt)
     if not delivered:
@@ -186,7 +217,8 @@ async def send_to_tmux_if_active(
         if thinking_msg is not None:
             with contextlib.suppress(TelegramAPIError):
                 await thinking_msg.delete()
-        await tmux_manager.close_buffer(key)
+        if queued_buffer:
+            await tmux_manager.discard_last_buffer(key)
     return True
 
 
@@ -313,7 +345,7 @@ async def ensure_exec_mode_ready(
 class _StreamCtx:
     """Shared state for per-mode on_event handlers.
 
-    Handlers mutate ``send_failed`` and ``accumulated_text`` directly;
+    Handlers mutate ``send_failed`` directly;
     ``sent_message_ids`` is a shared list reference used for bookkeeping.
     Ctx lifetime spans a single ``send_streaming_response`` call — not
     shared across concurrent requests, so no locking is needed.
@@ -327,8 +359,9 @@ class _StreamCtx:
     used_tmux: bool
     live_buffer: LiveStatusBuffer | None
     sent_message_ids: list[int]
-    accumulated_text: str = ""
     send_failed: bool = False
+    closed_turn_ids: set[str] = field(default_factory=set)
+    delivered_turn_ids: set[str] = field(default_factory=set)
 
 
 async def _send_status_silent(ctx: _StreamCtx, content: str) -> None:
@@ -354,7 +387,7 @@ async def _format_and_send_chunks(
     *,
     label: str,
     record_fn: Callable[[int], None] | None = None,
-) -> None:
+) -> bool:
     """Split *content* into HTML chunks and send with plain fallback.
 
     Short-circuits on the first fatal outcome and flips ``ctx.send_failed``
@@ -383,103 +416,111 @@ async def _format_and_send_chunks(
                 record_fn(outcome.message_id)
         if outcome.fatal:
             ctx.send_failed = True
-            break
+            return False
+        if outcome.message_id is None:
+            return False
+    return True
 
 
-def _record_tmux_message(ctx: _StreamCtx, msg_id: int) -> None:
-    """Bind *msg_id* to the current tmux session_id for reply-to-resume.
+def _tmux_session_snapshot(ctx: _StreamCtx) -> tuple[str, str | None, str | None] | None:
+    """Capture the answer event's authoritative tmux session identity."""
+    if not ctx.used_tmux or ctx.tmux_manager is None:
+        return None
+    return ctx.tmux_manager.get_session_snapshot(ctx.channel_key)
+
+
+def _record_tmux_message(
+    ctx: _StreamCtx,
+    msg_id: int,
+    snapshot: tuple[str, str | None, str | None] | None,
+) -> None:
+    """Bind *msg_id* to an answer event's immutable tmux session snapshot.
 
     Must happen inside ``on_event`` because the tmux tail is long-lived
     (exits only on /cancel, /clear, tmux death, or 6h timeout), so any
-    post-stream recording would fire hours after the user's message — if
-    ever. Reads session_id and provider from ``tmux_manager`` (live tmux
-    state) because ``session_manager``'s copy may carry a stale engine
-    after a reply-driven engine switch.
+    post-stream recording would fire hours after the user's message — if ever.
+    The snapshot is captured before Telegram I/O so a reply-driven session
+    switch during flood wait cannot rebind an old answer to the new session.
     """
-    if not ctx.used_tmux or ctx.tmux_manager is None:
-        return
-    snapshot = ctx.tmux_manager.get_session_snapshot(ctx.channel_key)
     if snapshot is None:
         return
     sid, provider, model = snapshot
     ctx.session_manager.record_message(msg_id, sid, ctx.channel_key, provider=provider, model=model)
 
 
-async def _handle_text_event(ctx: _StreamCtx, event: StreamEvent) -> None:
-    """Text-event handling shared across all modes.
+async def _send_tmux_answer(ctx: _StreamCtx, content: str, *, label: str) -> bool:
+    """Deliver one tmux answer event through the rich/fallback final-answer contract.
 
-    Non-tmux: accumulate for the single final message sent after ``send_stream``
-    returns. Tmux: the CC TUI transcript has no ``result_message`` event, so
-    ``text`` events are the actual CC response — ship each as its own HTML
-    message. Multiple blocks (reasoning → tool → text) surface as multiple
-    messages; CC TUI emits no end-of-response marker we could batch on.
+    Tmux tails emit answers while ``send_stream`` is still running, so delivery and
+    reply-to-resume recording must both happen inside ``on_event``. Rich success
+    records the returned message directly; the legacy callback keeps the existing
+    per-chunk recording behavior and prevents duplicate bookkeeping after fallback.
     """
+    snapshot = _tmux_session_snapshot(ctx)
+    legacy_message_ids: list[int] = []
+
+    async def _send_legacy_text(text: str) -> SendOutcome:
+        before = len(ctx.sent_message_ids)
+        complete = await _format_and_send_chunks(
+            ctx,
+            text,
+            label=label,
+            record_fn=lambda mid: _record_tmux_message(ctx, mid, snapshot),
+        )
+        legacy_message_ids.extend(ctx.sent_message_ids[before:])
+        last_id = legacy_message_ids[-1] if legacy_message_ids else None
+        return SendOutcome(
+            message_id=last_id,
+            fatal=ctx.send_failed,
+            complete=complete,
+        )
+
+    async def _send_legacy() -> SendOutcome:
+        return await _send_legacy_text(content)
+
+    def _record_rich(message_id: int) -> None:
+        ctx.sent_message_ids.append(message_id)
+        _record_tmux_message(ctx, message_id, snapshot)
+
+    outcome = await send_rich_final_answer(
+        final_text=content,
+        send_rich=lambda rich_message: ctx.message.answer_rich(rich_message),
+        legacy_fallback=_send_legacy,
+        legacy_chunk_fallback=_send_legacy_text,
+        on_rich_sent=_record_rich,
+        label=f"{label}_rich",
+        flood_retry_limit=300.0,
+    )
+    if outcome.fatal:
+        ctx.send_failed = True
+    return outcome.complete and (outcome.message_id is not None or bool(legacy_message_ids))
+
+
+async def _handle_text_event(ctx: _StreamCtx, event: StreamEvent) -> None:
+    """Send verbose intermediate text as its own Telegram message."""
     if not ctx.used_tmux:
-        ctx.accumulated_text += event.content
+        await _format_and_send_chunks(
+            ctx,
+            event.content,
+            label=f"text {ctx.channel_key}",
+        )
         return
 
-    await _format_and_send_chunks(
+    await _send_tmux_answer(
         ctx,
         event.content,
         label=f"text {ctx.channel_key}",
-        record_fn=lambda mid: _record_tmux_message(ctx, mid),
     )
 
 
-async def _handle_result_message_event(ctx: _StreamCtx, event: StreamEvent) -> None:
-    """Tmux persistent-mode result-message handling.
-
-    CC with Agent Team emits multiple results per user message — each one
-    ships as an immediate formatted message (vs. the non-tmux case where
-    a single final response is assembled post-stream). Empty/whitespace
-    content is already filtered by the centralized empty guard in on_event.
-    """
-    await _format_and_send_chunks(
-        ctx,
-        event.content,
-        label=f"result_message {ctx.channel_key}",
-        record_fn=lambda mid: _record_tmux_message(ctx, mid),
-    )
-
-
-async def _handle_event_verbose(ctx: _StreamCtx, event: StreamEvent) -> None:
-    """verbose-mode: every status is a silent message; text/result as usual."""
-    if event.type == "status":
-        await _send_status_silent(ctx, event.content)
-    elif event.type == "text":
-        await _handle_text_event(ctx, event)
-    elif event.type == "result_message":
-        await _handle_result_message_event(ctx, event)
-
-
-async def _handle_event_live(ctx: _StreamCtx, event: StreamEvent) -> None:
-    """live-mode fallthrough: status without a buffer behaves like verbose.
-
-    Status events that landed in an editable buffer are consumed BEFORE
-    dispatch (see ``_live_append_status`` in ``send_streaming_response``);
-    if we see a status here the buffer was unavailable (no bot, tmux
-    buffer unset) and we fall back to silent messages so the user still
-    sees progress.
-    """
-    if event.type == "status":
-        await _send_status_silent(ctx, event.content)
-    elif event.type == "text":
-        await _handle_text_event(ctx, event)
-    elif event.type == "result_message":
-        await _handle_result_message_event(ctx, event)
-
-
-async def _handle_event_minimal(ctx: _StreamCtx, event: StreamEvent) -> None:
-    """minimal-mode: status already dropped; text/result behave normally.
-
-    Status never reaches this handler — filtered in the dispatcher above.
-    The branch is omitted so a future dispatcher bug surfaces as a silent
-    drop rather than an unexpected status message flood.
-    """
-    if event.type == "text":
-        await _handle_text_event(ctx, event)
-    elif event.type == "result_message":
-        await _handle_result_message_event(ctx, event)
+async def _handle_result_message_event(ctx: _StreamCtx, event: StreamEvent) -> bool:
+    """Deliver one normalized final answer, including tmux turns."""
+    label = f"result_message {ctx.channel_key}"
+    if ctx.used_tmux:
+        return await _send_tmux_answer(ctx, event.content, label=label)
+    before = len(ctx.sent_message_ids)
+    complete = await _format_and_send_chunks(ctx, event.content, label=label)
+    return complete and len(ctx.sent_message_ids) > before
 
 
 async def _send_final_response(ctx: _StreamCtx, final_text: str) -> None:
@@ -498,8 +539,11 @@ async def _send_final_response(ctx: _StreamCtx, final_text: str) -> None:
 
     response_message_ids: list[int] = []
 
+    async def _send_legacy_text(text: str) -> SendOutcome:
+        return await _send_legacy_final_response(ctx, text, reply_kb, response_message_ids)
+
     async def _send_legacy_final() -> SendOutcome:
-        return await _send_legacy_final_response(ctx, final_text, reply_kb, response_message_ids)
+        return await _send_legacy_text(final_text)
 
     if not ctx.send_failed:
         outcome = await send_rich_final_answer(
@@ -509,11 +553,11 @@ async def _send_final_response(ctx: _StreamCtx, final_text: str) -> None:
                 reply_markup=reply_kb,
             ),
             legacy_fallback=_send_legacy_final,
+            legacy_chunk_fallback=_send_legacy_text,
+            on_rich_sent=response_message_ids.append,
             label=f"final_rich {ctx.channel_key}",
             flood_retry_limit=300.0,
         )
-        if not response_message_ids and outcome.message_id is not None:
-            response_message_ids.append(outcome.message_id)
         if outcome.fatal:
             ctx.send_failed = True
 
@@ -553,9 +597,22 @@ async def _send_legacy_final_response(
             response_message_ids.append(outcome.message_id)
         if outcome.fatal:
             ctx.send_failed = True
-            return outcome
+            return SendOutcome(
+                message_id=outcome.message_id,
+                fatal=outcome.fatal,
+                complete=False,
+            )
+        if outcome.message_id is None:
+            return SendOutcome(
+                message_id=response_message_ids[-1] if response_message_ids else None,
+                complete=False,
+            )
     last_id = response_message_ids[-1] if response_message_ids else None
-    return SendOutcome(message_id=last_id, fatal=ctx.send_failed)
+    return SendOutcome(
+        message_id=last_id,
+        fatal=ctx.send_failed,
+        complete=not ctx.send_failed and last_id is not None,
+    )
 
 
 async def send_streaming_response(
@@ -652,7 +709,7 @@ async def send_streaming_response(
             initial_message_id=thinking_msg.message_id,
             header_text=thinking_text,
         )
-        await tmux_manager.set_buffer(channel_key, tmux_buffer)
+        await tmux_manager.queue_buffer(channel_key, tmux_buffer)
 
     ctx = _StreamCtx(
         message=message,
@@ -665,43 +722,71 @@ async def send_streaming_response(
         sent_message_ids=sent_message_ids,
     )
 
-    async def _live_append_status(event: StreamEvent) -> bool:
-        """Append a status event to the live buffer, if one is active.
+    async def _ensure_tmux_live_buffer() -> LiveStatusBuffer | None:
+        if not ctx.used_tmux or ctx.tmux_manager is None:
+            return ctx.live_buffer
+        raw = ctx.tmux_manager.get_buffer(ctx.channel_key)
+        if raw is not None and callable(getattr(raw, "append", None)):
+            return raw  # type: ignore[return-value]
+        if not ctx.tmux_manager.live_buffer_available():
+            return None
+        try:
+            sent = await ctx.message.answer(t("ui.thinking"), disable_notification=True)
+            bot = ctx.tmux_manager.get_live_bot()
+            buffer = LiveStatusBuffer(
+                bot=bot,  # type: ignore[arg-type]
+                chat_id=ctx.message.chat.id,
+                thread_id=ctx.channel_key[1],
+                initial_message_id=sent.message_id,
+                header_text=t("ui.thinking"),
+            )
+            await ctx.tmux_manager.set_buffer(
+                ctx.channel_key,
+                buffer,
+                turn_id=None,
+            )
+            return buffer
+        except Exception:
+            logger.warning(
+                "Failed to create live progress buffer for %s",
+                ctx.channel_key,
+                exc_info=True,
+            )
+            return None
 
-        Only status events (tool-call progress lines) go to the buffer —
-        text events are routed through ``_handle_text_event`` because the
-        HTML-mode buffer uses ``html.escape`` which would mangle CC's
-        markdown output. Re-reads the tmux buffer on every call so a
-        mid-stream rotation (new user message) picks up the fresh one.
-
-        Returns True iff the event landed in a buffer and must NOT be
-        forwarded to the mode dispatcher.
-        """
-        if ctx.stream_mode != "live" or event.type != "status":
-            return False
+    async def _live_append_progress(event: StreamEvent) -> None:
+        """Append progress to one editable surface; never fan out on failure."""
         buf: LiveStatusBuffer | None
         if ctx.used_tmux and ctx.tmux_manager is not None:
             raw = ctx.tmux_manager.get_buffer(ctx.channel_key)
-            buf = raw if isinstance(raw, LiveStatusBuffer) else None
+            buf = raw if raw is not None and callable(getattr(raw, "append", None)) else None  # type: ignore[assignment]
         else:
             buf = ctx.live_buffer
         if buf is None:
-            return False
-        # html.escape: status strings are plain text generated by our tool-status
-        # mapper — not CC markdown output.  We want literal display of any <, >, &
-        # in file paths or tool arguments, so use stdlib escape, not sanitize_html
-        # (which would restore Telegram-allowed tag names like <b> back to HTML).
-        await buf.append(html.escape(event.content))
-        return True
+            buf = await _ensure_tmux_live_buffer()
+        if buf is not None:
+            await buf.append(html.escape(event.content))
 
-    async def on_event(event: StreamEvent) -> None:
+    async def _close_turn_progress(turn_id: str | None) -> None:
+        token = turn_id or ""
+        if token in ctx.closed_turn_ids:
+            return
+        ctx.closed_turn_ids.add(token)
+        if ctx.used_tmux and ctx.tmux_manager is not None:
+            if ctx.tmux_manager.get_buffer(ctx.channel_key) is not None:
+                await ctx.tmux_manager.close_buffer(ctx.channel_key, turn_id)
+        elif ctx.live_buffer is not None:
+            await ctx.live_buffer.close()
+
+    async def on_event(event: StreamEvent) -> bool | None:
         # send_failed latches across subsequent events: stop sending to
         # Telegram, but keep accumulating non-tmux text so the final
         # summary still assembles if the retry policy eventually recovers.
-        if ctx.send_failed:
-            if event.type == "text" and not ctx.used_tmux:
-                ctx.accumulated_text += event.content
-            return
+        if ctx.send_failed and event.type != "result_message":
+            return None
+
+        # Long-lived tmux tails must observe /stream changes on the next event.
+        ctx.stream_mode = _resolve_stream_mode(topic_config, ctx.channel_key)
 
         # Central empty-content guard (W1.2). CC emits empty events at
         # compact boundaries, token-count-only events, and empty thinking
@@ -710,29 +795,49 @@ async def send_streaming_response(
         # Per-mode handlers receive only non-empty events.
         if event.type in ("status", "text", "result_message") and not event.content.strip():
             logger.debug("Dropping empty %s event on channel %s", event.type, ctx.channel_key)
-            return
+            return None
 
-        # Mode-specific early drops / routing done before dispatch so the
-        # per-mode handlers stay flat and uniform.
-        if ctx.stream_mode == "minimal" and event.type == "status":
-            return
-        if await _live_append_status(event):
-            return
-
-        match ctx.stream_mode:
-            case "live":
-                await _handle_event_live(ctx, event)
-            case "verbose":
-                await _handle_event_verbose(ctx, event)
-            case "minimal":
-                await _handle_event_minimal(ctx, event)
-            case _:  # defensive: unknown mode shouldn't silently drop events
+        action = stream_event_action(ctx.stream_mode, event)
+        if action == "drop":
+            return None
+        if action == "turn_start":
+            if ctx.used_tmux and ctx.tmux_manager is not None:
+                if ctx.stream_mode == "live":
+                    await ctx.tmux_manager.activate_next_buffer(
+                        ctx.channel_key,
+                        event.turn_id,
+                    )
+                else:
+                    await ctx.tmux_manager.discard_next_buffer(ctx.channel_key)
+            return None
+        if action == "turn_end":
+            await _close_turn_progress(event.turn_id)
+            return None
+        if action == "buffer_progress":
+            await _live_append_progress(event)
+            return None
+        if action == "separate_progress":
+            if event.type == "status":
+                await _send_status_silent(ctx, event.content)
+            elif event.type == "text":
+                await _handle_text_event(ctx, event)
+            return None
+        if action == "final":
+            if event.turn_id and event.turn_id in ctx.delivered_turn_ids:
                 logger.warning(
-                    "Unknown stream_mode %r on channel %s; falling back to verbose",
-                    ctx.stream_mode,
+                    "Dropping duplicate final for channel=%s turn_id=%s",
                     ctx.channel_key,
+                    event.turn_id,
                 )
-                await _handle_event_verbose(ctx, event)
+                return True
+            await _close_turn_progress(event.turn_id)
+            # A prior progress-send failure must not suppress the final.
+            ctx.send_failed = False
+            delivered = await _handle_result_message_event(ctx, event)
+            if delivered and event.turn_id:
+                ctx.delivered_turn_ids.add(event.turn_id)
+            return delivered
+        return None
 
     async def _notify_engine_changed(new_engine: str) -> None:
         """Surface auto-fallback the same way manual /engine does — same wording.
@@ -791,11 +896,9 @@ async def send_streaming_response(
                 logger.debug("Git sync notify skipped, event loop closing")
 
     # In tmux mode, results are sent immediately via result_message events.
-    # Don't use accumulated_text as fallback — it spans multiple interactions
-    # and would dump hours of output as one message on cancel.
     # In tmux each result_message is recorded inside on_event (long-lived tail),
     # so no post-stream recording is needed here.
-    final_text = response or (ctx.accumulated_text if not used_tmux else "")
+    final_text = response
     if not final_text:
         return
 

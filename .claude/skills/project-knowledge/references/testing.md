@@ -19,7 +19,7 @@ Minimal public tests should cover:
 
 - config defaults;
 - prompt fallback;
-- topic config parsing;
+- topic config parsing, including per-engine model overrides;
 - provider parser smoke behavior;
 - MCP bot server importability;
 - no private default working directory;

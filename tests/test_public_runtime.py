@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import json
 from pathlib import Path
@@ -13,6 +14,13 @@ from telegram_bot.core.services.claude import SessionManager
 from telegram_bot.core.services.providers import CODEX_ADAPTER, choose_available_engine
 from telegram_bot.core.services.rich_sender import detect_rich_send
 from telegram_bot.core.services.topic_config import TopicConfig
+
+
+def test_public_entrypoint_imports() -> None:
+    entrypoint = importlib.import_module("telegram_bot.__main__")
+
+    assert callable(entrypoint.main)
+    assert callable(entrypoint.make_recovery_on_event)
 
 
 def test_public_settings_default_cwd_is_generic(monkeypatch) -> None:
@@ -46,6 +54,33 @@ def test_public_start_wires_live_buffer_before_restore_all() -> None:
 
     assert "tmux_manager.wire_live_buffer(bot=bot, topic_config=topic_config)" in source
     assert source.index("tmux_manager.wire_live_buffer") < source.index("tmux_manager.restore_all")
+    assert "tmux_manager.restore_all(session_manager)" in source
+
+
+def test_public_start_wires_codex_update_and_tail_runtime() -> None:
+    source = Path("src/telegram_bot/__main__.py").read_text(encoding="utf-8")
+
+    assert "codex_update_service = CodexUpdateService(" in source
+    assert "tmux_manager.wire_codex_update_service(codex_update_service)" in source
+    assert 'dp["codex_update_service"] = codex_update_service' in source
+    assert "ForwardBatcher(bot=bot, transcriber=transcriber)" in source
+    assert "dp.include_router(tail_router)" in source
+    assert source.index("dp.include_router(tail_router)") < source.index(
+        "dp.include_router(text_router)"
+    )
+    assert "recovery_factory = make_recovery_on_event(" in source
+    assert "await tmux_manager.resume_tails(recovery_factory)" in source
+    assert "tmux_manager.start_modal_watchdog()" in source
+    assert "tmux_manager.start_transcript_watchdog()" in source
+    assert "await tmux_manager.stop_transcript_watchdog()" in source
+    assert "await tmux_manager.stop_modal_watchdog()" in source
+    assert "picker_store = PickerStore()" in source
+    assert "bot_defaults = BotDefaults(" in source
+    assert 'dp["picker_store"] = picker_store' in source
+    assert 'dp["bot_defaults"] = bot_defaults' in source
+    assert source.index("await tmux_manager.resume_tails(recovery_factory)") < source.index(
+        "await dp.start_polling"
+    )
 
 
 def test_public_prompt_modes_are_available() -> None:
@@ -119,6 +154,11 @@ def test_topic_config_parses_public_runtime_fields(tmp_path: Path) -> None:
                         "stream_mode": "minimal",
                         "exec_mode": "tmux",
                         "engine": "codex",
+                        "model": "legacy-model",
+                        "models": {
+                            "claude": "claude-model",
+                            "codex": "codex-model",
+                        },
                     }
                 }
             }
@@ -135,6 +175,47 @@ def test_topic_config_parses_public_runtime_fields(tmp_path: Path) -> None:
     assert topic.stream_mode == "minimal"
     assert topic.exec_mode == "tmux"
     assert topic.engine == "codex"
+    assert topic.model == "legacy-model"
+    assert topic.models == {
+        "claude": "claude-model",
+        "codex": "codex-model",
+    }
+
+
+def test_topic_config_normalizes_and_filters_model_overrides(tmp_path: Path) -> None:
+    config_path = tmp_path / "topic_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "topics": {
+                    "1": {
+                        "mode": "free",
+                        "model": "  legacy-model  ",
+                        "models": {
+                            "claude": "  claude-model  ",
+                            "codex": "bad model with spaces",
+                            "unknown": "private-model",
+                        },
+                    },
+                    "2": {
+                        "mode": "free",
+                        "model": {"invalid": "type"},
+                        "models": ["invalid", "type"],
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = TopicConfig(str(config_path), ".")
+
+    first = config.get_topic(1)
+    second = config.get_topic(2)
+
+    assert first.model == "legacy-model"
+    assert first.models == {"claude": "claude-model"}
+    assert second.model is None
+    assert second.models == {}
 
 
 def test_codex_provider_parser_smoke() -> None:
@@ -158,6 +239,7 @@ def test_public_bot_command_menu_is_public_only() -> None:
     command_names = {command.command for command in build_bot_commands("ru")}
 
     assert "clear" in command_names
+    assert "codex_update" in command_names
     assert "recycle" in command_names
     assert "mcpstatus" in command_names
     assert "tui" in command_names
@@ -171,6 +253,7 @@ def test_public_start_registers_bot_commands() -> None:
 
     assert "setup_bot_commands(bot)" in source
     assert source.index("setup_bot_commands(bot)") < source.index("dp.start_polling")
+    assert "_stop_polling_when_started(dp)" in source
 
 
 def test_mcp_bot_server_imports() -> None:

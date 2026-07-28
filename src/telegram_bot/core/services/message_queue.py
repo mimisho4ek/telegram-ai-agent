@@ -27,6 +27,7 @@ class QueueItem:
     entries: list[tuple[int, str]]  # (message_id, prompt)
     source_messages: list[Message]
     target_session_id: str | None = None
+    start_new_session: bool = False
 
 
 @dataclass
@@ -43,10 +44,7 @@ class ChatQueue:
 
 
 # Type alias for the process callback
-ProcessCallback = Callable[
-    [ChannelKey, str, list[Message], str | None],
-    Awaitable[None],
-]
+ProcessCallback = Callable[..., Awaitable[None]]
 
 
 def _combine_prompts(entries: list[tuple[int, str]]) -> str:
@@ -106,6 +104,7 @@ class MessageQueue:
         message_id: int,
         source_message: Message,
         target_session_id: str | None = None,
+        start_new_session: bool = False,
         suppress_notification: bool = False,
     ) -> None:
         """Add a message to the channel's queue.
@@ -122,26 +121,31 @@ class MessageQueue:
                 entries=[(message_id, prompt)],
                 source_messages=[source_message],
                 target_session_id=target_session_id,
+                start_new_session=start_new_session,
             )
             queue.items.append(item)
             logger.info(
                 "MSG_TRACE queue_enqueue channel=%s msg=%d action=immediate_start "
-                "prompt_len=%d target_sid=%s",
+                "prompt_len=%d target_sid=%s start_new_session=%s",
                 channel_key,
                 message_id,
                 len(prompt),
                 target_session_id,
+                start_new_session,
             )
             self._start_processing(channel_key)
             return
 
         # Processing is active — try to batch or create new item
-        target_key = target_session_id
         batched = False
 
         # Find last item in deque with matching target
         for item in reversed(queue.items):
-            if item.target_session_id == target_key:
+            if (
+                not start_new_session
+                and not item.start_new_session
+                and item.target_session_id == target_session_id
+            ):
                 item.entries.append((message_id, prompt))
                 item.source_messages.append(source_message)
                 batched = True
@@ -161,6 +165,7 @@ class MessageQueue:
                 entries=[(message_id, prompt)],
                 source_messages=[source_message],
                 target_session_id=target_session_id,
+                start_new_session=start_new_session,
             )
             queue.items.append(item)
             position = len(queue.items)
@@ -171,13 +176,14 @@ class MessageQueue:
             )
         logger.info(
             "MSG_TRACE queue_enqueue channel=%s msg=%d action=%s position=%d "
-            "prompt_len=%d target_sid=%s",
+            "prompt_len=%d target_sid=%s start_new_session=%s",
             channel_key,
             message_id,
             "appended_to_existing" if batched else "new_item",
             position,
             len(prompt),
             target_session_id,
+            start_new_session,
         )
 
         if suppress_notification:
@@ -243,21 +249,31 @@ class MessageQueue:
                 combined_prompt = _combine_prompts(item.entries)
                 logger.info(
                     "MSG_TRACE queue_dequeue channel=%s msg_ids=%s prompt_len=%d "
-                    "target_sid=%s remaining=%d",
+                    "target_sid=%s start_new_session=%s remaining=%d",
                     channel_key,
                     [mid for mid, _ in item.entries],
                     len(combined_prompt),
                     item.target_session_id,
+                    item.start_new_session,
                     len(queue.items),
                 )
 
                 try:
-                    await self._process_callback(
-                        channel_key,
-                        combined_prompt,
-                        item.source_messages,
-                        item.target_session_id,
-                    )
+                    if item.start_new_session:
+                        await self._process_callback(
+                            channel_key,
+                            combined_prompt,
+                            item.source_messages,
+                            item.target_session_id,
+                            start_new_session=True,
+                        )
+                    else:
+                        await self._process_callback(
+                            channel_key,
+                            combined_prompt,
+                            item.source_messages,
+                            item.target_session_id,
+                        )
                     queue.error_count = 0
                 except Exception:
                     # Drop semantics: the item was already popped above and is

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import re
 from collections.abc import Sequence
 from typing import Any, cast
 from urllib.parse import urlsplit
@@ -12,6 +13,7 @@ from markdown_it.common.utils import escapeHtml
 from markdown_it.token import Token
 
 _ALLOWED_LINK_SCHEMES = frozenset({"http", "https"})
+_LOCAL_FILE_LINE_LINK_RE = re.compile(r"^(?:[^:/?#\s]+/)*[^:/?#\s]*\.[^:/?#\s]+:\d+(?::\d+)?$")
 
 
 def _normalized_url(raw_url: str) -> str:
@@ -21,10 +23,34 @@ def _normalized_url(raw_url: str) -> str:
 def is_safe_rich_link(raw_url: str) -> bool:
     """Return whether *raw_url* can be emitted as a Telegram rich link."""
     url = _normalized_url(raw_url)
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError:
+        return False
     if parsed.scheme.lower() not in _ALLOWED_LINK_SCHEMES:
         return False
-    return parsed.username is None and parsed.password is None
+    return (
+        bool(parsed.netloc)
+        and hostname is not None
+        and parsed.username is None
+        and parsed.password is None
+    )
+
+
+def is_plain_text_rich_link(raw_url: str) -> bool:
+    """Return whether a link target can safely degrade to its visible label."""
+    url = _normalized_url(raw_url)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    if bool(url) and not parsed.scheme and not parsed.netloc:
+        return True
+    # RFC 3986 treats ``gdoc.py`` in ``gdoc.py:41`` as a URI scheme, even
+    # though agents use this shape as a local file + line reference.
+    return _LOCAL_FILE_LINE_LINK_RE.fullmatch(url) is not None
 
 
 def _build_parser() -> MarkdownIt:
@@ -64,10 +90,10 @@ def _build_parser() -> MarkdownIt:
     rules["link_close"] = _link_close
 
     def _image(tokens: Sequence[Token], idx: int, options: Any, env: Any) -> str:
-        src = str(tokens[idx].attrGet("src") or "")
-        if not is_safe_rich_link(src):
-            return escapeHtml(tokens[idx].content)
-        return f'<img src="{escapeHtml(_normalized_url(src))}" />'
+        # Final-answer Markdown is untrusted model output. Never turn image
+        # syntax into an automatically fetched remote resource: a prompt-
+        # injected URL could otherwise become a tracking/exfiltration beacon.
+        return escapeHtml(tokens[idx].content)
 
     rules["image"] = _image
 

@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     topic_config_path: str = "./topic_config.json"
     notification_chat_id: int | None = None
     tmux_sessions_dir: str = "./tmux_sessions"
+    codex_update_timeout_sec: float = 180
+    codex_update_cooldown_sec: float = 86400
+    codex_auto_update_enabled: bool = True
 
 
 @functools.lru_cache(maxsize=1)

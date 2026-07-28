@@ -31,6 +31,7 @@ from telegram_bot.core.keyboards import (
 )
 from telegram_bot.core.messages import reset_lang_cache, t
 from telegram_bot.core.services.claude import SessionManager
+from telegram_bot.core.services.codex_update import CodexUpdateResult, CodexUpdateService
 from telegram_bot.core.services.message_queue import MessageQueue
 from telegram_bot.core.services.picker_store import PickerState, PickerStore
 from telegram_bot.core.services.providers import engine_display_name
@@ -46,6 +47,7 @@ from telegram_bot.core.services.topic_config import (
     _VALID_ENGINES,
     _VALID_EXEC_MODES,
     _VALID_STREAM_MODES,
+    Engine,
     TopicConfig,
 )
 from telegram_bot.core.services.topic_runtime import BotDefaults, resolve_topic_runtime_config
@@ -73,6 +75,41 @@ def _exec_mode_picker_caption(mode: str) -> str:
 
 
 router = Router(name="commands")
+
+
+def _format_codex_update_time(value: float | None) -> str:
+    if value is None:
+        return "never"
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(value))
+
+
+def _format_codex_update_output(output: str) -> str:
+    return html.escape(output or "No output")
+
+
+def _codex_update_active_check(
+    tmux_manager: TmuxManager,
+    session_manager: SessionManager,
+) -> bool:
+    return tmux_manager.has_live_provider("codex") or session_manager.has_active_provider_process(
+        "codex"
+    )
+
+
+def _codex_update_result_message(result: CodexUpdateResult) -> str:
+    if result.status == "success":
+        return t("ui.codex_update_success", output=_format_codex_update_output(result.output))
+    if result.status == "already_running":
+        return t("ui.codex_update_already_running")
+    if result.status == "blocked_active_sessions":
+        return t("ui.codex_update_active_sessions")
+    if result.status == "skipped_cooldown":
+        return t("ui.codex_update_cooldown")
+    return t(
+        "ui.codex_update_failed",
+        status=result.status,
+        output=_format_codex_update_output(result.output),
+    )
 
 
 def _resume_caption(
@@ -141,6 +178,41 @@ async def handle_language(message: Message) -> None:
     os.environ["BOT_LANG"] = lang
     reset_lang_cache()
     await message.answer(t("ui.language_changed", lang=lang))
+
+
+@router.message(Command("codex_update"))
+async def handle_codex_update(
+    message: Message,
+    codex_update_service: CodexUpdateService,
+    tmux_manager: TmuxManager,
+    session_manager: SessionManager,
+) -> None:
+    """Run or inspect the bot-managed Codex CLI updater."""
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip().lower() == "status":
+        state = codex_update_service.status()
+        output = f"<pre>{_format_codex_update_output(state.last_output)}</pre>"
+        await message.answer(
+            t(
+                "ui.codex_update_status",
+                status=state.last_status or "never",
+                last_success=_format_codex_update_time(state.last_success_at),
+                output=output,
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    running = await message.answer(t("ui.codex_update_running"))
+    result = await codex_update_service.run_manual(
+        active_check=lambda: _codex_update_active_check(tmux_manager, session_manager)
+    )
+    response = _codex_update_result_message(result)
+    with contextlib.suppress(TelegramBadRequest):
+        await running.edit_text(response, parse_mode="HTML")
+        return
+    await message.answer(response, parse_mode="HTML")
 
 
 async def _reset_channel(
@@ -584,6 +656,7 @@ async def handle_stream_mode(message: Message, topic_config: TopicConfig) -> Non
 async def on_stream_mode_click(
     callback: CallbackQuery,
     topic_config: TopicConfig,
+    tmux_manager: TmuxManager | None = None,
 ) -> None:
     """Apply a new stream_mode for the topic the picker was posted in."""
     if callback.data is None or callback.message is None:
@@ -607,10 +680,15 @@ async def on_stream_mode_click(
         )
         return
 
+    previous_mode = topic_config.get_topic(thread_id).stream_mode
     ok = await topic_config.update_stream_mode(thread_id, mode)  # type: ignore[arg-type]
     if not ok:
         await callback.answer(t("ui.stream_mode_write_failed"), show_alert=True)
         return
+    if previous_mode == "live" and mode != "live" and tmux_manager is not None:
+        await tmux_manager.close_buffer(
+            (callback.message.chat.id, thread_id),
+        )
 
     # Refresh both caption and keyboard so the visible current value matches the checkmark.
     try:
@@ -768,13 +846,16 @@ async def on_engine_click(
     if raw_value not in _VALID_ENGINES:
         await callback.answer(t("ui.engine_invalid"), show_alert=True)
         return
-    new_engine = raw_value
+    new_engine: Engine = "claude" if raw_value == "claude" else "codex"
 
     if new_engine == current.engine:
         await callback.answer(t("ui.engine_already"))
         return
 
-    ok = await topic_config.update_engine_model(thread_id, new_engine, None)  # type: ignore[arg-type]
+    if current.models:
+        ok = await topic_config.update_engine(thread_id, new_engine)
+    else:
+        ok = await topic_config.update_engine_model(thread_id, new_engine, None)
     if not ok:
         await callback.answer(t("ui.engine_write_failed"), show_alert=True)
         return
@@ -789,7 +870,7 @@ async def on_engine_click(
         thread_id,
         current.engine,
         new_engine,
-        current.model,
+        current.models.get(new_engine, current.model),
     )
     engine_name = engine_display_name(new_engine)
     try:

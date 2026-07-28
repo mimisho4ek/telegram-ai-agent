@@ -20,8 +20,6 @@ Determine:
 - Current `chat_id` and `thread_id` from `<telegram-context>` when available.
 - `TELEGRAM_BOT_TOKEN` from `.env` or the environment.
 - Forum chat ID:
-  - For Pasha's production assistant, create project topics in the Telegram
-    supergroup forum, not in the private bot chat.
   - Prefer `NOTIFICATION_CHAT_ID` from `.env` when it points to a
     `type=supergroup` chat with `is_forum=true`.
   - Use `<telegram-context>.chat_id` only when it is already a supergroup forum
@@ -39,7 +37,7 @@ Determine:
   coding sessions.
 - Desired `stream_mode`: usually `live`; alternatives are `verbose` and
   `minimal`.
-- Optional provider `model`.
+- Optional per-engine `models` map.
 
 ## Create A Topic
 
@@ -89,9 +87,10 @@ For project topics:
 - Use an absolute path.
 - Set `type` to `project`.
 - Set `mode` to `free`. Public project topics use the normal generic prompt.
-- Set `mcp_config` to an absolute project MCP config path, or `null` to use the
-  bot-generated MCP config.
-- Set `engine`, `exec_mode`, `stream_mode`, and optional `model`.
+- Set `mcp_config` to `null` by default so the bot generates its send-tool MCP
+  runtime. Use an existing absolute project MCP config only on explicit request
+  after reviewing it for secrets and private dependencies.
+- Set `engine`, `exec_mode`, `stream_mode`, and optional model overrides.
 
 Example:
 
@@ -104,8 +103,7 @@ Example:
   "mcp_config": null,
   "stream_mode": "live",
   "exec_mode": "tmux",
-  "engine": "codex",
-  "model": null
+  "engine": "codex"
 }
 ```
 
@@ -120,8 +118,7 @@ For the bundled demo assistant topic:
   "mcp_config": null,
   "stream_mode": "live",
   "exec_mode": "subprocess",
-  "engine": "claude",
-  "model": null
+  "engine": "claude"
 }
 ```
 
@@ -129,17 +126,34 @@ Write JSON with 2-space indentation and preserve existing unrelated topics.
 `TopicConfig` reloads by file mtime, so a restart is not needed for most field
 changes.
 
+Load and preserve the existing `models` map, then update only the requested
+engine keys. For new configuration, omit legacy `model`. When migrating a
+known provider-specific legacy value, move it to `models[current_engine]`
+before clearing `model`; if its provider is uncertain, ask the user.
+
+```json
+{
+  "models": {
+    "codex": "CODEX_MODEL_NAME"
+  }
+}
+```
+
+Runtime resolution is `models[active_engine]`, then legacy `model`, then the
+provider default. Manual `/engine` changes preserve the map. During automatic
+missing-CLI fallback, the first fallback request uses the provider default; the
+saved per-engine override applies from the next topic-config lookup.
+
 ## Public Prompt Modes
 
 The public repo ships with two prompt modes:
 
 - `free`: the standard project/general prompt for real work.
-- `task`: an example of a second prompt mode. Users can replace it with their
-  own prompt file and set topics to that custom mode.
+- `task`: an example of a replaceable second workflow. For no-code
+  customization, edit `task-manager.md` and keep `mode=task`.
 
-Do not add `knowledge`, `project`, `blog`, or other private prompt modes to
-public docs, examples, tests, or setup skills. If a user wants a custom mode,
-create a new public-safe prompt file and document that custom mode explicitly.
+A new mode name requires code changes to the runtime resolver and explicit tool
+policy, plus public tests. A prompt file alone is not a complete mode.
 
 ## Confirm
 
@@ -150,6 +164,7 @@ Tell the user:
 - `engine`.
 - `exec_mode`.
 - `stream_mode`.
+- Stored model overrides and the resolved active model, when configured.
 - Whether a restart is required.
 
 ## Do Not

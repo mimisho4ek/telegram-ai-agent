@@ -5,11 +5,10 @@
       "type": "project",
       "mode": "free",
       "cwd": "/path/to/your/project",
-      "mcp_config": "/path/to/your/project/.mcp.json",
+      "mcp_config": null,
       "stream_mode": "live",
       "exec_mode": "tmux",
-      "engine": "codex",
-      "model": null
+      "engine": "codex"
     },
     "REPLACE_WITH_DEMO_THREAD_ID": {
       "name": "Task demo",
@@ -19,8 +18,7 @@
       "mcp_config": null,
       "stream_mode": "live",
       "exec_mode": "subprocess",
-      "engine": "claude",
-      "model": null
+      "engine": "claude"
     }
   },
   "routing": {

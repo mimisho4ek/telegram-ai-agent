@@ -19,12 +19,15 @@ in a later task.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from telegram_bot.core.messages import t
 from telegram_bot.core.services.claude import StreamEvent, _tool_status
+
+logger = logging.getLogger(__name__)
 
 # `system` is intentionally NOT filtered wholesale — compact_boundary /
 # status=compacting arrive as type=system,subtype=... and must reach the
@@ -144,6 +147,266 @@ def tail_transcript(path: Path) -> list[ParsedEvent]:
         if parsed is not None:
             out.append(parsed)
     return out
+
+
+class ClaudeTranscriptParser:
+    """Stateful Claude JSONL parser with provider-native turn boundaries."""
+
+    _NON_TERMINAL_REASONS: ClassVar[set[str]] = {
+        "tool_use",
+        "pause_turn",
+        "compaction",
+    }
+    _TERMINAL_REASONS: ClassVar[set[str]] = {
+        "end_turn",
+        "stop_sequence",
+        "max_tokens",
+        "model_context_window_exceeded",
+        "refusal",
+    }
+
+    def __init__(self) -> None:
+        self._turn_seq = 0
+        self._turn_id: str | None = None
+        self._pending_end_turn_request: str | None = None
+        self._pending_terminal_request: str | None = None
+        self._pending_terminal_text = ""
+        self._pending_terminal_reason: str | None = None
+        self._ambiguous_completion = False
+        self._last_terminal_request: str | None = None
+
+    @property
+    def current_turn_id(self) -> str | None:
+        return self._turn_id
+
+    @property
+    def has_pending_terminal(self) -> bool:
+        return bool(self._pending_terminal_text)
+
+    @property
+    def has_unfinished_completion(self) -> bool:
+        return (
+            self.has_pending_terminal
+            or self._pending_end_turn_request is not None
+            or self._ambiguous_completion
+        )
+
+    @staticmethod
+    def is_turn_boundary(raw: str) -> bool:
+        data = _load_object(raw)
+        return data is not None and _is_top_level_user(data)
+
+    def parse(self, raw: str) -> tuple[list[StreamEvent], str | None]:
+        data = _load_object(raw)
+        if data is None:
+            return [], None
+
+        session_id = data.get("sessionId")
+        sid = session_id if isinstance(session_id, str) else None
+        event_type = data.get("type")
+        if event_type == "user":
+            if not _is_top_level_user(data):
+                return [], sid
+            events = self.flush_pending_terminal()
+            events.extend(self._close_unfinished_turn())
+            self._turn_seq += 1
+            self._turn_id = f"claude:{self._turn_seq}"
+            self._pending_end_turn_request = None
+            self._ambiguous_completion = False
+            self._last_terminal_request = None
+            events.append(StreamEvent("turn_start", "", turn_id=self._turn_id))
+            return events, sid
+
+        if event_type == "system":
+            parsed = parse_jsonl_line(raw)
+            if parsed is not None and parsed.kind == "status":
+                text = str(parsed.payload.get("text", ""))
+                return self._with_turn([StreamEvent("status", text)] if text else []), sid
+            return [], sid
+
+        if event_type != "assistant":
+            return [], sid
+
+        message = data.get("message")
+        if not isinstance(message, dict):
+            return [], sid
+        raw_content = message.get("content")
+        content = raw_content if isinstance(raw_content, list) else []
+        stop_reason = message.get("stop_reason")
+        request_id = data.get("requestId")
+        request = request_id if isinstance(request_id, str) else None
+        if (
+            stop_reason in self._TERMINAL_REASONS
+            and request is not None
+            and request == self._last_terminal_request
+            and self._turn_id is None
+        ):
+            logger.warning(
+                "Ignoring duplicate Claude terminal fragment request_id=%s",
+                request,
+            )
+            return [], sid
+
+        turn_id = self._ensure_turn()
+
+        text_parts: list[str] = []
+        ordered_progress: list[StreamEvent] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text":
+                block_text = block.get("text")
+                if isinstance(block_text, str) and block_text:
+                    text_parts.append(block_text)
+                    ordered_progress.append(StreamEvent("text", block_text, turn_id=turn_id))
+            elif block_type == "tool_use":
+                name = block.get("name")
+                tool_input = block.get("input")
+                ordered_progress.append(
+                    StreamEvent(
+                        "status",
+                        _tool_status(
+                            str(name or ""),
+                            tool_input if isinstance(tool_input, dict) else None,
+                        ),
+                        turn_id=turn_id,
+                    )
+                )
+
+        text = "".join(text_parts)
+        if stop_reason in self._NON_TERMINAL_REASONS:
+            return ordered_progress, sid
+
+        if stop_reason in self._TERMINAL_REASONS:
+            progress = [event for event in ordered_progress if event.type == "status"]
+            if stop_reason == "end_turn" and not text:
+                self._pending_end_turn_request = request
+                return progress, sid
+            if not text:
+                self._last_terminal_request = request
+                return [*progress, *self._finish_with(_terminal_diagnostic(str(stop_reason)))], sid
+
+            self._pending_end_turn_request = None
+            self._ambiguous_completion = False
+            if request == self._pending_terminal_request:
+                self._pending_terminal_text = _merge_generation_text(
+                    self._pending_terminal_text,
+                    text,
+                )
+            else:
+                self._pending_terminal_request = request
+                self._pending_terminal_text = text
+            self._pending_terminal_reason = str(stop_reason)
+            return progress, sid
+
+        logger.warning(
+            "Unknown Claude stop_reason %r request_id=%s turn_id=%s",
+            stop_reason,
+            request,
+            turn_id,
+        )
+        self._ambiguous_completion = True
+        return ordered_progress, sid
+
+    def finish(self) -> list[StreamEvent]:
+        """Close an unfinished turn when the transcript transport stops."""
+        events = self.flush_pending_terminal()
+        events.extend(self._close_unfinished_turn())
+        return events
+
+    def flush_pending_terminal(self) -> list[StreamEvent]:
+        """Finalize terminal text after all adjacent generation rows were parsed."""
+        if not self._pending_terminal_text:
+            return []
+        final_text = self._pending_terminal_text
+        reason = self._pending_terminal_reason
+        request = self._pending_terminal_request
+        self._pending_terminal_text = ""
+        self._pending_terminal_reason = None
+        self._pending_terminal_request = None
+        if reason == "max_tokens":
+            final_text += t("ui.claude_limit_note")
+        elif reason == "model_context_window_exceeded":
+            final_text += t("ui.claude_context_note")
+        self._last_terminal_request = request
+        return self._finish_with(final_text)
+
+    def _ensure_turn(self) -> str:
+        if self._turn_id is None:
+            self._turn_seq += 1
+            self._turn_id = f"claude:{self._turn_seq}"
+        return self._turn_id
+
+    def _with_turn(self, events: list[StreamEvent]) -> list[StreamEvent]:
+        turn_id = self._ensure_turn()
+        for event in events:
+            event.turn_id = turn_id
+        return events
+
+    def _finish_with(self, content: str) -> list[StreamEvent]:
+        turn_id = self._turn_id
+        if turn_id is None:
+            return []
+        self._turn_id = None
+        self._pending_end_turn_request = None
+        self._ambiguous_completion = False
+        return [
+            StreamEvent("result_message", content, turn_id=turn_id),
+            StreamEvent("turn_end", "", turn_id=turn_id),
+        ]
+
+    def _close_unfinished_turn(self) -> list[StreamEvent]:
+        if self._turn_id is None:
+            return []
+        if self._ambiguous_completion:
+            return self._finish_with(t("ui.claude_unknown_completion"))
+        return self._finish_with(t("ui.claude_no_text"))
+
+
+def _load_object(raw: str) -> dict[str, Any] | None:
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _is_top_level_user(data: dict[str, Any]) -> bool:
+    if data.get("type") != "user":
+        return False
+    message = data.get("message")
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return True
+    if not isinstance(content, list):
+        return False
+    return not any(
+        isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+    )
+
+
+def _terminal_diagnostic(stop_reason: str) -> str:
+    return {
+        "end_turn": t("ui.claude_no_text"),
+        "stop_sequence": t("ui.claude_stop_sequence_no_text"),
+        "max_tokens": t("ui.claude_limit_no_text"),
+        "model_context_window_exceeded": t("ui.claude_context_no_text"),
+        "refusal": t("ui.claude_refused_no_text"),
+    }[stop_reason]
+
+
+def _merge_generation_text(current: str, fragment: str) -> str:
+    """Merge adjacent Claude snapshots/fragments without duplicating prefixes."""
+    if not current:
+        return fragment
+    if fragment == current or current.endswith(fragment):
+        return current
+    if fragment.startswith(current):
+        return fragment
+    return current + fragment
 
 
 def parse_transcript_event(

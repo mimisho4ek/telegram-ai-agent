@@ -6,7 +6,7 @@ facade:
 1. `ModalWatchdog` — background task that periodically probes every active
    session for an idle-modal overlay and posts a Telegram alert.
 2. `send_modal_alert` / `send_modal_idle_alert` — free functions that post
-   the two alert variants and update the dedup map.
+   the two alert variants and update the continuous-modal lifecycle latch.
 3. `safe_send_and_enter` — capture → send-keys → verify-visible → Enter
    pipeline shared between `send_direct` and `send_stream` (Wave 3 B1 fix).
 
@@ -175,7 +175,7 @@ async def send_modal_alert(
     reason: str = "unspecified",
 ) -> None:
     """Post the modal-blocked alert to Telegram. No-op if live-buffer
-    wiring is absent.
+    wiring is absent or this continuous modal already produced an alert.
 
     `reason` names the specific code path that decided to alert (see the
     string enum maintained at the call sites — `_safe_send_codex` and
@@ -196,6 +196,8 @@ async def send_modal_alert(
     # callback handler) and the user is prompted to call /tui again.
     epoch = manager.expected_epoch(state)
     text = ""
+    reserved = False
+    posted = False
     try:
         text, keyboard = render_modal_alert(
             prompt=prompt,
@@ -203,7 +205,15 @@ async def send_modal_alert(
             session_id=epoch,
             chat_id=channel_key[0],
             thread_id=channel_key[1],
+            reason=reason,
         )
+        # Reserve before the network await. User-send and watchdog paths can
+        # discover the same modal in adjacent tasks; without this atomic
+        # check/add both would post before either one latched the channel.
+        if channel_key in manager._modal_alerted_channels:
+            return
+        manager._modal_alerted_channels.add(channel_key)
+        reserved = True
         sent = await bot.send_message(  # type: ignore[attr-defined]
             chat_id=channel_key[0],
             text=text,
@@ -211,6 +221,7 @@ async def send_modal_alert(
             reply_markup=keyboard,
             message_thread_id=channel_key[1],
         )
+        posted = True
         message_id = getattr(sent, "message_id", "?")
         logger.info(
             "TUI_IO: modal alert posted session=%s channel=%s message_id=%s",
@@ -225,9 +236,6 @@ async def send_modal_alert(
             message_id=message_id,
             pane=pane,
         )
-        # Dedup key for the watchdog — store the pane we alerted on;
-        # the watchdog skips re-alerting until the pane actually changes.
-        manager._last_modal_pane[channel_key] = pane
     except (TimeoutError, TelegramAPIError, OSError) as exc:
         logger.warning(
             "TUI_IO: modal alert failed session=%s exc=%s reason=%r text_len=%d",
@@ -236,6 +244,11 @@ async def send_modal_alert(
             _safe_exc_message(exc),
             len(text),
         )
+    finally:
+        # Failed and cancelled sends remain retryable. On success the
+        # pre-await reservation becomes the continuous-modal lifecycle latch.
+        if reserved and not posted:
+            manager._modal_alerted_channels.discard(channel_key)
 
 
 async def send_modal_idle_alert(
@@ -247,8 +260,7 @@ async def send_modal_idle_alert(
     reason: str = "modal_idle_detected",
 ) -> None:
     """Watchdog counterpart of `send_modal_alert`: same layout minus the
-    user-prompt echo. Writes to the same `_last_modal_pane` dedup map so
-    a second watchdog tick on the unchanged pane is a no-op."""
+    user-prompt echo. Shares its continuous-modal lifecycle latch."""
     bot = manager._bot
     if bot is None:
         return
@@ -256,6 +268,8 @@ async def send_modal_idle_alert(
     # when state.session_id is None (codex startup-modal cold-start).
     epoch = manager.expected_epoch(state)
     text = ""
+    reserved = False
+    posted = False
     try:
         text, keyboard = render_modal_idle_alert(
             pane=pane,
@@ -263,6 +277,10 @@ async def send_modal_idle_alert(
             chat_id=channel_key[0],
             thread_id=channel_key[1],
         )
+        if channel_key in manager._modal_alerted_channels:
+            return
+        manager._modal_alerted_channels.add(channel_key)
+        reserved = True
         sent = await bot.send_message(  # type: ignore[attr-defined]
             chat_id=channel_key[0],
             text=text,
@@ -270,6 +288,7 @@ async def send_modal_idle_alert(
             reply_markup=keyboard,
             message_thread_id=channel_key[1],
         )
+        posted = True
         message_id = getattr(sent, "message_id", "?")
         logger.info(
             "TUI_IO: modal idle-alert posted session=%s channel=%s message_id=%s",
@@ -284,7 +303,6 @@ async def send_modal_idle_alert(
             message_id=message_id,
             pane=pane,
         )
-        manager._last_modal_pane[channel_key] = pane
     except (TimeoutError, TelegramAPIError, OSError) as exc:
         logger.warning(
             "TUI_IO: modal idle-alert failed session=%s exc=%s reason=%r text_len=%d",
@@ -293,3 +311,6 @@ async def send_modal_idle_alert(
             _safe_exc_message(exc),
             len(text),
         )
+    finally:
+        if reserved and not posted:
+            manager._modal_alerted_channels.discard(channel_key)

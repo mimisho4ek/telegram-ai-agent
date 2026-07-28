@@ -15,6 +15,14 @@ Common optional settings:
 - `TOPIC_CONFIG_PATH`: defaults to `./topic_config.json`.
 - `TMUX_SESSIONS_DIR`: defaults to `./tmux_sessions`.
 - `DEEPGRAM_API_KEY`: enables voice transcription.
+- `TELEGRAM_CLAUDE_BIN` / `TELEGRAM_CODEX_BIN`: optional absolute CLI paths
+  when the service user cannot resolve the binaries automatically.
+- `CODEX_AUTO_UPDATE_ENABLED`: enables automatic and manual Codex updates;
+  defaults to `true`.
+- `CODEX_UPDATE_TIMEOUT_SEC`: update timeout; defaults to 180 seconds.
+- `CODEX_UPDATE_COOLDOWN_SEC`: minimum interval between automatic updates;
+  defaults to 86400 seconds. Manual `/codex_update` bypasses the cooldown but
+  is blocked by another update or active Codex sessions.
 
 `topic_config.example.json` is public-safe and can be copied to
 `topic_config.json`. The real `topic_config.json` is runtime config and must not
@@ -27,11 +35,19 @@ Topic fields:
 - `mode`: public prompt mode. `free` is the standard project/general prompt.
   `task` is a replaceable example of a second prompt mode.
 - `cwd`: absolute project path or `null` for `DEFAULT_CWD`.
-- `mcp_config`: absolute MCP config path or `null` for bot-generated config.
+- `mcp_config`: `null` by default for bot-generated config. Use an existing
+  absolute project config only after reviewing it for secrets and private
+  dependencies; its extra servers have separate provider/tool-policy
+  constraints.
 - `stream_mode`: `verbose`, `live`, or `minimal`.
 - `exec_mode`: `subprocess` or `tmux`.
 - `engine`: `claude` or `codex`.
-- `model`: optional model override.
+- `model`: legacy single model override.
+- `models`: optional per-engine overrides keyed by `claude` and/or `codex`.
+  Resolution is `models[active_engine]`, then `model`, then the provider
+  default; manual `/engine` changes preserve the map. During automatic
+  missing-CLI fallback, the first fallback request uses the provider default;
+  the saved per-engine override applies from the next request.
 
 Public prompt modes expose the generic bot MCP tools
 `send_message`, `send_image`, `send_image_gallery`, and `send_document`.

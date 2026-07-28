@@ -51,9 +51,18 @@ from telegram_bot.core.services.cc_modes import (
     Mode,
     _get_mode_prompt,
 )
-from telegram_bot.core.services.codex_mcp import build_codex_mcp_config_args
+from telegram_bot.core.services.codex_mcp import (
+    build_codex_mcp_config_args,
+    discover_codex_mcp_server_names,
+)
 from telegram_bot.core.services.process_cleanup import tagged_processes, terminate_processes
-from telegram_bot.core.services.providers import CODEX_ADAPTER, ExecCommand, choose_available_engine
+from telegram_bot.core.services.providers import (
+    CODEX_ADAPTER,
+    ExecCommand,
+    choose_available_engine,
+    claude_binary,
+    codex_process_env,
+)
 from telegram_bot.core.services.topic_runtime import BotDefaults, resolve_topic_runtime_config
 from telegram_bot.core.types import ChannelKey
 
@@ -331,6 +340,15 @@ class SessionManager:
         self._apply_topic_config(self._sessions[channel_key], channel_key)
         return self._sessions[channel_key]
 
+    def has_active_provider_process(self, provider: str) -> bool:
+        """True when a subprocess session for ``provider`` is still running."""
+        for session in self._sessions.values():
+            if session.engine != provider or session.process is None:
+                continue
+            if session.process.returncode is None:
+                return True
+        return False
+
     async def _kill_process(self, process: asyncio.subprocess.Process) -> None:
         """Kill a CC subprocess and its process group immediately via SIGKILL."""
         if process.returncode is not None:
@@ -373,11 +391,12 @@ class SessionManager:
         mcp_config: str = "",
         chat_id: int = 0,
         thread_id: int | None = None,
+        model: str | None = None,
     ) -> list[str]:
         """Build claude CLI command with mode-specific prompts, tools, and mcp-config."""
         mcp_path = mcp_config or str(Path(self._settings.project_root) / ".mcp.bot.json")
         base = [
-            "claude",
+            claude_binary(),
             "--output-format",
             "stream-json",
             "--verbose",
@@ -391,6 +410,8 @@ class SessionManager:
             "--max-turns",
             str(self._settings.cc_max_turns),
         ]
+        if model:
+            base.extend(["--model", model])
         # Only attach an MCP config when the file exists. CC fails fast with
         # "Invalid MCP configuration" if --mcp-config points at a missing path,
         # which would block the bot for any user without an .mcp.bot.json.
@@ -441,6 +462,7 @@ class SessionManager:
                     session.mcp_config,
                     session.chat_id,
                     session.thread_id,
+                    session.model,
                 ),
                 cwd=cwd,
             )
@@ -452,13 +474,20 @@ class SessionManager:
         output_path = output_dir / f"{session.chat_id}-{session.thread_id}-{time.time_ns()}.txt"
         with contextlib.suppress(FileNotFoundError):
             output_path.unlink()
+        codex_env = codex_process_env()
+        codex_home = Path(codex_env.get("CODEX_HOME", Path.home() / ".codex"))
+        inherited_servers = discover_codex_mcp_server_names(cwd, codex_home=codex_home)
+        mcp_args = build_codex_mcp_config_args(
+            session.mcp_config,
+            inherited_server_names=inherited_servers,
+        )
 
         if session.session_id:
             argv = [
                 CODEX_ADAPTER.binary(),
                 "exec",
                 "resume",
-                *build_codex_mcp_config_args(session.mcp_config),
+                *mcp_args,
                 session.session_id,
                 "--json",
                 "--skip-git-repo-check",
@@ -471,7 +500,7 @@ class SessionManager:
             argv = [
                 CODEX_ADAPTER.binary(),
                 "exec",
-                *build_codex_mcp_config_args(session.mcp_config),
+                *mcp_args,
                 "--json",
                 "--cd",
                 cwd,
@@ -495,6 +524,7 @@ class SessionManager:
                 session.thread_id,
             ),
             output_last_message_path=output_path,
+            env=codex_env,
         )
 
     def build_tmux_startup_args(
@@ -504,6 +534,7 @@ class SessionManager:
         *,
         session_id_new: str | None = None,
         resume_session_id: str | None = None,
+        model: str | None = None,
     ) -> list[str]:
         """Build CC TUI startup args for persistent tmux session.
 
@@ -547,7 +578,7 @@ class SessionManager:
             assert resume_session_id is not None  # narrowing for mypy
             session_flag = ["--resume", resume_session_id]
         cmd = [
-            "claude",
+            claude_binary(),
             *session_flag,
             "--dangerously-skip-permissions",
             # in-process keeps only the team lead visible in the tmux window
@@ -564,6 +595,8 @@ class SessionManager:
             "--max-turns",
             str(self._settings.cc_max_turns),
         ]
+        if model:
+            cmd.extend(["--model", model])
         if Path(mcp_path).exists():
             cmd.extend(["--mcp-config", mcp_path, "--strict-mcp-config"])
         return cmd
@@ -607,7 +640,7 @@ class SessionManager:
         self,
         prompt: str,
         session: SessionData,
-        on_event: Callable[[StreamEvent], Awaitable[None] | None],
+        on_event: Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
     ) -> str:
         """Run a CC subprocess, stream events via on_event, return final result."""
         session_id = session.session_id
@@ -682,6 +715,7 @@ class SessionManager:
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,
                     cwd=cwd,
+                    env=exec_cmd.env,
                     limit=10
                     * 1024
                     * 1024,  # 10MB line buffer (CC embeds base64 PDFs in stream JSON)
@@ -948,7 +982,7 @@ class SessionManager:
     async def _read_stream(
         self,
         process: asyncio.subprocess.Process,
-        on_event: Callable[[StreamEvent], Awaitable[None] | None],
+        on_event: Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
         provider: str = "claude",
     ) -> tuple[str, str | None]:
         """Read stream-json lines from process stdout, dispatch events.
@@ -1043,7 +1077,7 @@ class SessionManager:
         self,
         channel_key: ChannelKey,
         prompt: str,
-        on_event: Callable[[StreamEvent], Awaitable[None] | None],
+        on_event: Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
         *,
         on_engine_changed: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:

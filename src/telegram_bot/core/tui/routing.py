@@ -29,6 +29,7 @@ BOT_RESERVED_COMMANDS = frozenset(
         "/language",
         "/day",
         "/tui",
+        "/codex_update",
     }
 )
 

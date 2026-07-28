@@ -42,15 +42,20 @@ def resolve_topic_runtime_config(
     )
     mode = (
         settings.mode
-        if settings.mode in {"task", "knowledge", "free", "blog", "project"}
+        if settings.mode in {"task", "knowledge", "assistant", "free", "blog", "project"}
         else defaults.mode
     )
+    engine = settings.engine or defaults.engine
+    models = settings.models if isinstance(settings.models, dict) else {}
+    model = models.get(engine)
+    if model is None:
+        model = settings.model if settings.model is not None else defaults.model
     return TopicRuntimeConfig(
         cwd=cwd,
         mode=mode,  # type: ignore[arg-type]
         mcp_config=mcp_config,
-        engine=settings.engine or defaults.engine,
-        model=settings.model if settings.model is not None else defaults.model,
+        engine=engine,
+        model=model,
         exec_mode=settings.exec_mode or defaults.exec_mode,
         stream_mode=settings.stream_mode or defaults.stream_mode,
     )

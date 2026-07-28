@@ -22,9 +22,20 @@ online with a user-facing install message when neither CLI is available.
 
 `stream_mode` controls Telegram progress delivery:
 
-- `verbose`: separate progress messages.
-- `live`: editable progress buffer plus final answer.
-- `minimal`: final-answer oriented delivery.
+- `verbose`: every tool/status event is a separate silent message.
+- `live`: tool/status events share an editable progress buffer.
+- `minimal`: tool/status events are suppressed.
+
+Human-readable intermediate text remains separate in every stream mode. Provider
+transcripts are normalized into turn start, ordered status/text events, one
+logical final answer, and turn end. A live progress buffer belongs to one turn,
+so late events cannot close a newer turn's progress surface.
+
+Tmux transcript delivery uses a FIFO callback queue and persists a transcript
+checkpoint only after all Telegram callbacks through that point complete.
+Recovery rebuilds parser state from the nearest provider turn boundary before
+resuming delivery. An uncertain or incomplete Telegram send may be replayed
+after restart, but its missing suffix is not silently skipped.
 
 Incoming Telegram rich messages are normalized into agent-readable text. Text
 blocks, tables, footnotes, and structural placeholders stay visible; rich photo
