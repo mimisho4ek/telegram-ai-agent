@@ -12,18 +12,12 @@ restart.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
 
 _MODE_PROMPT_FALLBACKS: dict[str, tuple[str, ...]] = {
     "task": ("task.md", "task-manager.md", "default.md"),
-    "knowledge": ("knowledge.md", "default.md"),
-    "assistant": ("assistant.md", "free.md", "default.md"),
     "free": ("free.md", "default.md"),
-    "project": ("project.md", "default.md"),
-    "blog": ("blog.md", "default.md"),
-    "meeting": ("meeting.md", "free.md", "default.md"),
 }
 
 
@@ -41,14 +35,9 @@ def _read_prompt_with_fallback(mode: str) -> str:
 # Preload prompts once at import so the first `_get_mode_prompt` call is
 # cheap. Public builds may ship only default.md and task-manager.md.
 TASK_MODE_PROMPT = _read_prompt_with_fallback("task")
-KNOWLEDGE_MODE_PROMPT = _read_prompt_with_fallback("knowledge")
-ASSISTANT_MODE_PROMPT = _read_prompt_with_fallback("assistant")
 FREE_MODE_PROMPT = _read_prompt_with_fallback("free")
-PROJECT_MODE_PROMPT = _read_prompt_with_fallback("project")
-BLOG_MODE_PROMPT = _read_prompt_with_fallback("blog")
-MEETING_MODE_PROMPT = _read_prompt_with_fallback("meeting")
 
-Mode = Literal["task", "knowledge", "assistant", "free", "project", "blog", "meeting"]
+Mode = str
 
 # Default mode used when no per-topic mode is configured (auto-registered topics).
 DEFAULT_MODE: Mode = "free"
@@ -70,33 +59,13 @@ _CONTEXT7_MCP_TOOLS = (
 )
 
 TASK_MODE_TOOLS = f"Skill,{_BOT_MCP_TOOLS},{_CONTEXT7_MCP_TOOLS},Read,Grep,Glob,Bash,Agent"
-KNOWLEDGE_MODE_TOOLS = (
-    f"Skill,{_BOT_MCP_TOOLS},{_CONTEXT7_MCP_TOOLS},Read,Write,Edit,Grep,Glob,Bash,Agent"
-)
 FREE_MODE_TOOLS = (
     f"Skill,{_BOT_MCP_TOOLS},{_CONTEXT7_MCP_TOOLS},Read,Write,Edit,Grep,Glob,Bash,Agent"
 )
-ASSISTANT_MODE_TOOLS = FREE_MODE_TOOLS
-PROJECT_MODE_TOOLS = (
-    f"{_BOT_MCP_TOOLS},{_CONTEXT7_MCP_TOOLS},Read,Write,Edit,Grep,Glob,Bash,Agent,Skill"
-)
-BLOG_MODE_TOOLS = (
-    f"Skill,{_BOT_MCP_TOOLS},{_CONTEXT7_MCP_TOOLS},Read,Write,Edit,Grep,Glob,Bash,Agent"
-)
-# Least-privilege: a mute meeting agent gets EXACTLY these two tools — no bot
-# send, no file access, no Singularity, no Bash/Agent/Skill. Under
-# bypassPermissions this allowlist is the only escalation boundary, so it must
-# never gain members. See MEETING_MODE_TOOLS asserts in the captured runner.
-MEETING_MODE_TOOLS = "mcp__meetings__create_meeting,mcp__contacts__resolve_contact"
 
 _MODE_TOOLS: dict[str, str] = {
     "task": TASK_MODE_TOOLS,
-    "knowledge": KNOWLEDGE_MODE_TOOLS,
-    "assistant": ASSISTANT_MODE_TOOLS,
     "free": FREE_MODE_TOOLS,
-    "project": PROJECT_MODE_TOOLS,
-    "blog": BLOG_MODE_TOOLS,
-    "meeting": MEETING_MODE_TOOLS,
 }
 
 # prompts/ content is looked up per call with an mtime-cached scan, so a new

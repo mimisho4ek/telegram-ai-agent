@@ -11,6 +11,10 @@ Required:
 Common optional settings:
 
 - `BOT_LANG`: `en` or `ru`.
+- `PROJECT_ROOT`: standard single-checkout root; defaults to `.`.
+- `APP_ROOT`: optional installed-code root. Empty means `PROJECT_ROOT`.
+- `AGENT_WORKSPACE_ROOT`: optional editable-project/runtime root. Empty means
+  `PROJECT_ROOT`.
 - `DEFAULT_CWD`: default working directory for new topics; public default is `.`.
 - `FILE_CACHE_DIR`: downloaded media cache.
 - `TOPIC_CONFIG_PATH`: defaults to `./topic_config.json`.
@@ -73,6 +77,11 @@ and tells the user to install Claude Code or Codex.
 
 Voice transcription requires a Deepgram API key in `DEEPGRAM_API_KEY`; leave it
 empty to disable voice messages.
+
+Dotenv values are read without variable interpolation so credentials remain
+opaque. Bot-launched Claude Code and Codex processes receive a constrained
+allowlist of non-secret runtime variables rather than the bot's complete
+environment.
 
 Never commit `.env`, `.mcp*.json`, session JSON files, `tmux_sessions/`,
 `data/`, virtual environments, Python caches, or test/lint/typecheck caches.

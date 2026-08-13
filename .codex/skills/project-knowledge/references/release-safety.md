@@ -30,6 +30,10 @@ Required public skills in both `.claude/skills/` and `.codex/skills/`:
 - `bot-setup`
 - `topic-setup`
 
+`.codex/.sync/` is host-local synchronization state, not a public artifact.
+Remove it before release validation or staging; the sync script fails closed
+while it exists even though Git normally ignores it.
+
 Never use `git add -A` for release staging. Review every staged path.
 
 Blockers:

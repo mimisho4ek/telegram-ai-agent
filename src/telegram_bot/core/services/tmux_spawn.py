@@ -17,10 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 from telegram_bot.core.services.process_cleanup import cleanup_tmux_runtime
+from telegram_bot.core.services.providers import agent_env_prefix, agent_process_env
 from telegram_bot.core.types import ChannelKey
 
 logger = logging.getLogger(__name__)
@@ -45,6 +48,70 @@ TMUX_NEW_SESSION_RETRY_DELAY_SEC = 0.2
 # sweet spot between "user notices within a handful of seconds" and "we're
 # not spamming capture-pane for no reason".
 MODAL_WATCHDOG_INTERVAL_SEC = 8.0
+
+
+def sanitized_tmux_environment(
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, str]:
+    """Return a safe tmux env and scrub inherited secrets from a live server."""
+    env = agent_process_env()
+    if "TMUX_TMPDIR" not in env:
+        # Without an explicit selector this may be the operator's ordinary
+        # shared tmux server. Never mutate its global environment.
+        return env
+    probe = run(
+        ["tmux", "show-environment", "-g"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    stdout = getattr(probe, "stdout", "")
+    if probe.returncode != 0 or not isinstance(stdout, str):
+        return env
+
+    for line in stdout.splitlines():
+        key = line.removeprefix("-").partition("=")[0]
+        if key and key not in env:
+            run(
+                ["tmux", "set-environment", "-gu", key],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+    return env
+
+
+def tmux_pane_inherits_disallowed_environment(
+    session_name: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> bool:
+    """Detect legacy panes that inherited service-only environment variables."""
+    env = agent_process_env()
+    result = run(
+        ["tmux", "display-message", "-p", "-t", f"={session_name}:", "#{pane_pid}"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    if result.returncode != 0:
+        return False
+    try:
+        pane_pid = int((getattr(result, "stdout", "") or "").strip())
+        raw = Path(f"/proc/{pane_pid}/environ").read_bytes()
+    except (OSError, ValueError):
+        return False
+    pane_keys = {
+        entry.partition(b"=")[0].decode(errors="ignore")
+        for entry in raw.split(b"\0")
+        if b"=" in entry
+    }
+    service_only = set(os.environ) - set(env)
+    return bool(pane_keys & service_only)
 
 
 def make_session_name(channel_key: ChannelKey, *, prefix: str = "cc-") -> str:
@@ -124,6 +191,10 @@ def spawn_tmux_sync(
     try:
         session_dir.mkdir(parents=True, exist_ok=True)
         cleanup_tmux_runtime(session_name=name, runtime_path=str(session_dir / "mcp.runtime.json"))
+        tmux_env = sanitized_tmux_environment(run=subprocess.run)
+        sanitized_startup = startup_cmd
+        if startup_cmd[:2] != ["env", "-i"]:
+            sanitized_startup = [*agent_env_prefix(binary=startup_cmd[0]), *startup_cmd]
         result = subprocess.run(
             [
                 "tmux",
@@ -135,11 +206,12 @@ def spawn_tmux_sync(
                 "200",
                 "-y",
                 "50",
-                *startup_cmd,
+                *sanitized_startup,
             ],
             capture_output=True,
             text=True,
             cwd=cwd,
+            env=tmux_env,
         )
     except Exception:
         logger.warning("tmux spawn raised for %s", name, exc_info=True)

@@ -36,16 +36,9 @@ from telegram_bot.core.services.cc_events import (
 )
 from telegram_bot.core.services.cc_modes import (
     _MODE_TOOLS,
-    BLOG_MODE_PROMPT,
-    BLOG_MODE_TOOLS,
     DEFAULT_MODE,
     FREE_MODE_PROMPT,
     FREE_MODE_TOOLS,
-    KNOWLEDGE_MODE_PROMPT,
-    KNOWLEDGE_MODE_TOOLS,
-    MEETING_MODE_TOOLS,
-    PROJECT_MODE_PROMPT,
-    PROJECT_MODE_TOOLS,
     TASK_MODE_PROMPT,
     TASK_MODE_TOOLS,
     Mode,
@@ -59,6 +52,7 @@ from telegram_bot.core.services.process_cleanup import tagged_processes, termina
 from telegram_bot.core.services.providers import (
     CODEX_ADAPTER,
     ExecCommand,
+    agent_process_env,
     choose_available_engine,
     claude_binary,
     codex_process_env,
@@ -75,15 +69,9 @@ logger = logging.getLogger(__name__)
 # (tmux_manager, streaming, handlers/*) use these names; listing them
 # in __all__ makes the re-export explicit for mypy.
 __all__ = [
-    "BLOG_MODE_PROMPT",
-    "BLOG_MODE_TOOLS",
     "DEFAULT_MODE",
     "FREE_MODE_PROMPT",
     "FREE_MODE_TOOLS",
-    "KNOWLEDGE_MODE_PROMPT",
-    "KNOWLEDGE_MODE_TOOLS",
-    "PROJECT_MODE_PROMPT",
-    "PROJECT_MODE_TOOLS",
     "TASK_MODE_PROMPT",
     "TASK_MODE_TOOLS",
     "TOOL_STATUS_MAP",
@@ -102,9 +90,6 @@ __all__ = [
 ]
 
 _POLL_SEC = 30.0  # readline poll interval for inactivity check (not user-facing)
-# Canonical tool set for the mute meeting agent — the fail-closed guard
-# (`_assert_meeting_least_privilege`) compares the live allowlist against this.
-_MEETING_EXPECTED_TOOLS = MEETING_MODE_TOOLS
 _MODEL_OVERRIDE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 
 
@@ -158,6 +143,20 @@ def _provider_from_session_id(session_id: str) -> str:
         return "claude"
 
 
+def _resolve_workspace_path(settings: object, value: str | Path) -> Path:
+    """Resolve a live path while tolerating legacy test/downstream settings doubles."""
+    resolver = getattr(settings, "resolve_workspace_path", None)
+    if callable(resolver):
+        resolved = resolver(value)
+        if isinstance(resolved, str | Path):
+            return Path(resolved)
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    root = Path(str(getattr(settings, "project_root", ".")))
+    return root / path
+
+
 class SessionManager:
     def __init__(
         self,
@@ -169,10 +168,14 @@ class SessionManager:
         self._sessions: dict[ChannelKey, SessionData] = {}
         self._cleanup_task: asyncio.Task[None] | None = None
         self._msg_sessions: collections.OrderedDict[int, object] = collections.OrderedDict()
-        self._mapping_path = Path(settings.session_mapping_path)
+        self._mapping_path = _resolve_workspace_path(settings, settings.session_mapping_path)
         # Persisted channel_key → session_id: lets bot resume CC session after restart
         self._channel_sessions: dict[str, object] = {}
-        self._channel_sessions_path = self._mapping_path.with_name("channel_sessions.json")
+        self._channel_sessions_path = (
+            _resolve_workspace_path(settings, settings.channel_sessions_path)
+            if settings.channel_sessions_path
+            else self._mapping_path.with_name("channel_sessions.json")
+        )
         # Channels where next message should ignore reply-to-resume (set after kill/reset)
         self._fresh_channels: set[str] = set()
         # Copy of the module-level _MODE_TOOLS so instance-scoped extensions
@@ -180,19 +183,24 @@ class SessionManager:
         self._mode_tools: dict[str, str] = dict(_MODE_TOOLS)
 
     def extend_mode_tools(self, extensions: dict[str, list[str]]) -> None:
-        """Append tool names to the allowedTools list of one or more modes.
+        """Register or extend application-owned allowedTools policies.
 
         Used by private bot entry points to attach assistant-specific MCP
         tools that must not live in the public core.
         """
         for mode, tools in extensions.items():
-            if mode not in self._mode_tools:
-                raise ValueError(f"Unknown mode: {mode!r}")
             if not tools:
                 continue
-            current = self._mode_tools[mode]
+            current = self._mode_tools.get(mode, "")
             addition = ",".join(tools)
             self._mode_tools[mode] = f"{current},{addition}" if current else addition
+
+    def mode_tools(self, mode: str) -> str:
+        """Return the effective allowedTools policy for a registered mode."""
+        try:
+            return self._mode_tools[mode]
+        except KeyError:
+            raise ValueError(f"Unknown mode: {mode!r}") from None
 
     @staticmethod
     def extend_tool_status_map(extensions: dict[str, str]) -> None:
@@ -232,19 +240,19 @@ class SessionManager:
         """
         configured = Path(self._settings.file_cache_dir)
         if not configured.is_absolute():
-            configured = Path(self._settings.project_root) / configured
+            configured = self._settings.workspace_root_path / configured
         return str(configured.resolve())
 
     def default_mcp_config_path(self) -> str:
         """Default MCP config path used by bot-launched sessions."""
-        return str(default_bot_mcp_config(self._settings.project_root))
+        return str(default_bot_mcp_config(self._settings.app_root_path))
 
     def _default_cwd(self) -> Path:
         """Default agent working directory, resolved relative to project_root."""
         configured = Path(self._settings.default_cwd)
         if configured.is_absolute():
             return configured
-        return Path(self._settings.project_root) / configured
+        return self._settings.workspace_root_path / configured
 
     @staticmethod
     def _ch_key(channel_key: ChannelKey) -> str:
@@ -288,7 +296,7 @@ class SessionManager:
             topic,
             BotDefaults(
                 cwd=self._default_cwd(),
-                mcp_config=Path(self._settings.project_root) / ".mcp.bot.json",
+                mcp_config=Path(self.default_mcp_config_path()),
             ),
         )
         session.mode = runtime.mode
@@ -304,7 +312,7 @@ class SessionManager:
             session = SessionData(
                 mode="free",
                 cwd=str(self._default_cwd()),
-                mcp_config=str(Path(self._settings.project_root) / ".mcp.bot.json"),
+                mcp_config=self.default_mcp_config_path(),
                 chat_id=channel_key[0],
                 thread_id=channel_key[1],
             )
@@ -394,7 +402,7 @@ class SessionManager:
         model: str | None = None,
     ) -> list[str]:
         """Build claude CLI command with mode-specific prompts, tools, and mcp-config."""
-        mcp_path = mcp_config or str(Path(self._settings.project_root) / ".mcp.bot.json")
+        mcp_path = mcp_config or self.default_mcp_config_path()
         base = [
             claude_binary(),
             "--output-format",
@@ -465,6 +473,7 @@ class SessionManager:
                     session.model,
                 ),
                 cwd=cwd,
+                env=agent_process_env(binary=claude_binary()),
             )
 
         output_dir = Path(self.file_cache_dir) / "codex-last-message"
@@ -571,7 +580,7 @@ class SessionManager:
                 "build_tmux_startup_args: pass exactly one of "
                 "session_id_new (new session) or resume_session_id (existing transcript)"
             )
-        mcp_path = mcp_config or str(Path(self._settings.project_root) / ".mcp.bot.json")
+        mcp_path = mcp_config or self.default_mcp_config_path()
         if session_id_new is not None:
             session_flag = ["--session-id", session_id_new]
         else:
@@ -662,7 +671,7 @@ class SessionManager:
                 base_mcp_config=original_mcp_config or self.default_mcp_config_path(),
                 channel_key=(session.chat_id, session.thread_id),
                 runtime_path=runtime_mcp_path,
-                project_root=self._settings.project_root,
+                project_root=self._settings.app_root_path,
             )
             exec_cmd = self._build_exec_command(prompt, session)
         except Exception:
@@ -872,58 +881,37 @@ class SessionManager:
 
         return result_text
 
-    def _assert_meeting_least_privilege(self, mcp_config: str) -> None:
-        """Fail-closed guard for the mute meeting agent (sec-audit #5).
-
-        bypassPermissions auto-approves the permission prompt, so the
-        --allowedTools allowlist is the ONLY thing keeping this agent from
-        escalating. Any drift (a typo, a prompt fallback, an accidental
-        Singularity `extend_mode_tools`, a swapped MCP config) must crash the
-        run instead of silently widening the agent's reach.
-        """
-        tools = self._mode_tools["meeting"]
-        if tools != _MEETING_EXPECTED_TOOLS:
-            raise RuntimeError(f"meeting tool allowlist drifted: {tools!r}")
-        if Path(mcp_config).name != "meeting-trigger.json":
-            raise RuntimeError(
-                f"meeting mcp config must be meeting-trigger.json, got {mcp_config!r}"
-            )
-        try:
-            servers = set(
-                json.loads(Path(mcp_config).read_text(encoding="utf-8")).get("mcpServers", {})
-            )
-        except (OSError, ValueError) as exc:
-            raise RuntimeError(f"meeting mcp config unreadable: {mcp_config}") from exc
-        if servers != {"meetings", "contacts"}:
-            raise RuntimeError(f"meeting mcp config has unexpected servers: {servers}")
-
-    async def run_meeting_capture(
+    async def run_captured_prompt(
         self,
         prompt: str,
         *,
+        mode: Mode,
         mcp_config: str,
         session_id: str | None = None,
     ) -> tuple[str, str | None]:
-        """Run the mute meeting agent once and capture its final text + session_id.
+        """Run one isolated Claude prompt and capture final text plus session id.
 
-        Self-contained captured (non-streaming) path used by the meeting-trigger
-        feature. It deliberately does NOT route through
-        ``ensure_bot_runtime_mcp_config`` (the agent gets no bot server) and does
-        NOT touch the channel-keyed session store — the caller owns the returned
-        ``session_id`` and feeds it back via ``session_id=`` to resume a
-        clarification dialogue across chats (the built-in reply-to-resume is
-        channel-locked and cannot bridge group → "Встречи" topic).
-
-        Pass ``session_id=None`` for a fresh run, or a prior id to resume.
+        The application owns the mode policy, MCP config validation, and returned
+        session id. This path does not attach the bot MCP server or mutate the
+        channel-keyed session store.
         """
-        self._assert_meeting_least_privilege(mcp_config)
-        cmd = self._build_command(prompt, session_id, mode="meeting", mcp_config=mcp_config)
+        self.mode_tools(mode)
+        cmd = self._build_command(prompt, session_id, mode=mode, mcp_config=mcp_config)
+        process_env = agent_process_env(binary=claude_binary())
+        process_env.update(
+            {
+                "APP_ROOT": str(self._settings.app_root_path),
+                "AGENT_WORKSPACE_ROOT": str(self._settings.workspace_root_path),
+                "PROJECT_ROOT": str(self._settings.workspace_root_path),
+            }
+        )
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
-            cwd=self._settings.project_root,
+            cwd=self._settings.workspace_root_path,
+            env=process_env,
             limit=10 * 1024 * 1024,
         )
 
@@ -969,10 +957,10 @@ class SessionManager:
 
         stderr_text = "".join(stderr_buffer)
         if stderr_text:
-            logger.info("meeting CC stderr:\n%s", stderr_text[-2000:])
+            logger.info("Captured CC stderr:\n%s", stderr_text[-2000:])
         if process.returncode and process.returncode != 0 and not result_text:
             logger.warning(
-                "meeting CC exited code %d, stderr: %s",
+                "Captured CC exited code %d, stderr: %s",
                 process.returncode,
                 stderr_text[-500:] or "(empty)",
             )

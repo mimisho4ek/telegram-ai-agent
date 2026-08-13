@@ -16,7 +16,12 @@ from typing import TYPE_CHECKING, Any, cast
 from telegram_bot.core.services.bot_mcp_runtime import ensure_bot_runtime_mcp_config
 from telegram_bot.core.services.claude import StreamEvent
 from telegram_bot.core.services.providers import CODEX_ADAPTER
-from telegram_bot.core.services.tmux_spawn import file_size, spawn_tmux_sync
+from telegram_bot.core.services.tmux_spawn import (
+    file_size,
+    sanitized_tmux_environment,
+    spawn_tmux_sync,
+    tmux_pane_inherits_disallowed_environment,
+)
 from telegram_bot.core.services.tmux_state import TmuxSessionState, parse_state_entry
 from telegram_bot.core.types import ChannelKey
 
@@ -104,7 +109,11 @@ def _ensure_runtime_mcp_config(
     if session_manager is None:
         return
     settings = getattr(session_manager, "_settings", None)
-    project_root = getattr(settings, "project_root", None)
+    application_root = getattr(settings, "app_root_path", None)
+    if not isinstance(application_root, str | Path):
+        application_root = getattr(settings, "app_root", None) or getattr(
+            settings, "project_root", None
+        )
     default_getter = getattr(session_manager, "default_mcp_config_path", None)
     default_mcp = str(default_getter()) if callable(default_getter) else ""
     has_topic_config, current_topic_mcp = _topic_base_mcp_config(
@@ -121,7 +130,7 @@ def _ensure_runtime_mcp_config(
         base_mcp_config=base_mcp_config or None,
         channel_key=channel_key,
         runtime_path=Path(state.session_dir) / "mcp.runtime.json",
-        project_root=project_root,
+        project_root=application_root,
     )
 
 
@@ -182,6 +191,12 @@ def restore_all(
     if not raw:
         return {}
 
+    # tmux outlives the bot service and keeps a global environment. Remove
+    # variables outside the agent allowlist before reattaching live panes.
+    from telegram_bot.core.services import tmux_manager as _tm
+
+    sanitized_tmux_environment(run=_tm.subprocess.run)  # type: ignore[attr-defined]
+
     restored: dict[ChannelKey, TmuxSessionState] = {}
     for key_str, data in raw.items():
         try:
@@ -205,6 +220,24 @@ def restore_all(
             is_claude_tui = rv in {"tui-v1", "claude-tui-v1"} and state.provider == "claude"
             is_codex_tui = rv == "codex-tui-v1" and state.provider == "codex"
             is_supported_tui = is_claude_tui or is_codex_tui
+
+            if alive and is_supported_tui and tmux_pane_inherits_disallowed_environment(
+                state.session_name,
+                run=_tm.subprocess.run,  # type: ignore[attr-defined]
+            ):
+                logger.warning(
+                    "Restarting legacy tmux session %s with a sanitized environment",
+                    state.session_name,
+                )
+                _tm.subprocess.run(  # type: ignore[attr-defined]
+                    ["tmux", "kill-session", "-t", f"={state.session_name}"],
+                    capture_output=True,
+                    check=False,
+                    env=sanitized_tmux_environment(
+                        run=_tm.subprocess.run  # type: ignore[attr-defined]
+                    ),
+                )
+                alive = False
 
             if alive and is_supported_tui:
                 _ensure_runtime_mcp_config(

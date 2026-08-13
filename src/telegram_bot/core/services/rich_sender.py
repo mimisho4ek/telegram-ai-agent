@@ -387,6 +387,12 @@ def detect_rich_send(final_text: str) -> RichSendDecision:
     if any(not rich_html.strip() for rich_html in rich_html_chunks):
         return _fallback("empty-rich-html", fallback_text)
 
+    # Telegram's rich renderer ignores <ol start=...>, so an ordered list
+    # resuming mid-message (grouped plans, chunks split inside a list) would
+    # restart at 1. Legacy delivery keeps the literal source numbers.
+    if any('<ol start="' in rich_html for rich_html in rich_html_chunks):
+        return _fallback("ordered-list-restart", fallback_text)
+
     input_rich_messages = tuple(InputRichMessage(html=html) for html in rich_html_chunks)
     reason = "eligible-table" if has_table else "eligible-long"
     if len(input_rich_messages) > 1:

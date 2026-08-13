@@ -160,6 +160,8 @@ ALLOWED_USER_IDS=[123456789]
 BOT_LANG=en
 DEEPGRAM_API_KEY=
 PROJECT_ROOT=.
+APP_ROOT=
+AGENT_WORKSPACE_ROOT=
 DEFAULT_CWD=.
 FILE_CACHE_DIR=./data
 TOPIC_CONFIG_PATH=./topic_config.json
@@ -176,6 +178,11 @@ Notes:
 - `TELEGRAM_BOT_TOKEN`: create a bot in `@BotFather`.
 - `ALLOWED_USER_IDS`: JSON array of Telegram user IDs allowed to use the bot.
 - `BOT_LANG`: `en` or `ru`. Restart the bot after changing it.
+- `PROJECT_ROOT`: the standard single-checkout root. Leave `APP_ROOT` and
+  `AGENT_WORKSPACE_ROOT` empty for a normal installation.
+- `APP_ROOT` / `AGENT_WORKSPACE_ROOT`: optional advanced split layout. The
+  first contains installed code and MCP launchers; the second contains editable
+  projects, topic config, session mappings, tmux state, and downloaded files.
 - `DEFAULT_CWD`: default working directory for unconfigured topics.
 - `DEEPGRAM_API_KEY`: leave empty if you do not need voice messages.
 - `CODEX_AUTO_UPDATE_ENABLED`: enables automatic and manual Codex updates.
@@ -508,6 +515,12 @@ Do not expose the bot to untrusted users. Do not point project topics at
 directories you are not willing to let the agent read or edit. Prefer running
 the bot under a dedicated low-privilege Linux user. If the bot token leaks,
 rotate it in `@BotFather`.
+
+Values loaded from `.env` are treated as opaque strings, so token text such as
+`${NAME}` is not expanded. Agent subprocesses start with a constrained
+environment: bot tokens and unrelated service credentials are not inherited.
+The bot also uses a dedicated workspace-local tmux server by default and
+migrates only its own persisted sessions from older installations.
 
 ## Development
 

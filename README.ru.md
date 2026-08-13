@@ -161,6 +161,8 @@ ALLOWED_USER_IDS=[123456789]
 BOT_LANG=ru
 DEEPGRAM_API_KEY=
 PROJECT_ROOT=.
+APP_ROOT=
+AGENT_WORKSPACE_ROOT=
 DEFAULT_CWD=.
 FILE_CACHE_DIR=./data
 TOPIC_CONFIG_PATH=./topic_config.json
@@ -178,6 +180,11 @@ CODEX_UPDATE_COOLDOWN_SEC=86400
 - `ALLOWED_USER_IDS`: JSON array Telegram user IDs, которым можно пользоваться
   ботом.
 - `BOT_LANG`: `en` или `ru`. После смены языка перезапустите бота.
+- `PROJECT_ROOT`: стандартный корень единственного checkout. Для обычной
+  установки оставьте `APP_ROOT` и `AGENT_WORKSPACE_ROOT` пустыми.
+- `APP_ROOT` / `AGENT_WORKSPACE_ROOT`: необязательная схема с раздельными
+  каталогами. В первом лежат установленный код и MCP launchers, во втором —
+  редактируемые проекты, topic config, session mappings, tmux state и файлы.
 - `DEFAULT_CWD`: рабочая папка по умолчанию для ненастроенных топиков.
 - `DEEPGRAM_API_KEY`: оставьте пустым, если не нужны voice messages.
 - `CODEX_AUTO_UPDATE_ENABLED`: включает автоматические и ручные обновления
@@ -513,6 +520,12 @@ edits и shell/tool actions, разрешенные этим CLI.
 которые агенту нельзя читать или менять. Лучше запускать бота под отдельным
 low-privilege Linux user. Если bot token утек, перевыпустите его в
 `@BotFather`.
+
+Значения из `.env` читаются как непрозрачные строки, поэтому фрагменты вроде
+`${NAME}` внутри токена не разворачиваются. Agent subprocesses запускаются с
+ограниченным окружением и не наследуют bot tokens и посторонние credentials.
+По умолчанию бот также использует отдельный workspace-local tmux server и при
+обновлении переносит со старого сервера только собственные сохранённые сессии.
 
 ## Development
 

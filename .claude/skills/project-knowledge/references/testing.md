@@ -18,15 +18,18 @@ PYTHONDONTWRITEBYTECODE=1 uv run python -c "import telegram_bot; import telegram
 Minimal public tests should cover:
 
 - config defaults;
+- exact dotenv credential loading and split application/workspace roots;
 - prompt fallback;
 - topic config parsing, including per-engine model overrides;
-- provider parser smoke behavior;
+- provider parser behavior for current Codex item events, clarification finals,
+  and Claude local-command transcript records;
 - MCP bot server importability;
 - no private default working directory;
 - public command wiring for `/mode`, `/engine`, `/stream`, `/tui`, `/resume`,
   `/recycle`, and `/mcpstatus`;
 - public MCP tool allowlists, including `send_image_gallery` and Context7
   documentation tools.
+- ordered-list fallback when Telegram rich rendering would restart numbering.
 
 Manual Telegram QA is required before publication. Private deployed-bot QA is a
 regression signal; public-checkout/staging QA validates the public artifact.

@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 _TERM_GRACE_SEC = 1.0
 _PROC = Path("/proc")
+_EXTRA_MCP_PROCESS_MARKERS: dict[str, tuple[str, ...]] = {}
 
 
 @dataclass(frozen=True)
@@ -70,13 +71,19 @@ def classify_mcp_process(args: str) -> str | None:
         return "telegram"
     if "@playwright/mcp" in args:
         return "playwright"
-    if "singularity" in args and "mcp" in args:
-        return "singularity"
     if "google-docs-mcp" in args:
         return "google-docs"
     if "shadcn" in args and "mcp" in args:
         return "shadcn"
+    for kind, markers in _EXTRA_MCP_PROCESS_MARKERS.items():
+        if all(marker in args for marker in markers):
+            return kind
     return None
+
+
+def extend_mcp_process_classifiers(classifiers: dict[str, tuple[str, ...]]) -> None:
+    """Register application-owned MCP process markers for diagnostics."""
+    _EXTRA_MCP_PROCESS_MARKERS.update(classifiers)
 
 
 def tmux_pane_pid(session_name: str) -> int | None:

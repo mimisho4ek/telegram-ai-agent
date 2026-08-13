@@ -52,6 +52,59 @@ class ParsedEvent:
     payload: dict[str, Any]
 
 
+class _LegacyLocalCommandTracker:
+    """Recognize Claude-generated local-command rows without trusting their text alone."""
+
+    def __init__(self) -> None:
+        self._prompt_ids: set[str] = set()
+        self._anonymous_stage: Literal["command", "stdout"] | None = None
+
+    def consume(self, data: dict[str, Any]) -> bool:
+        if data.get("type") != "user":
+            self._anonymous_stage = None
+            return False
+        message = data.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        prompt_id = data.get("promptId")
+        if not isinstance(content, str):
+            self._anonymous_stage = None
+            return False
+
+        if self._consume_anonymous(content, prompt_id):
+            return True
+        if data.get("isMeta") is True and _has_xml_envelope(
+            content,
+            "local-command-caveat",
+        ):
+            if isinstance(prompt_id, str):
+                self._prompt_ids.add(prompt_id)
+            elif prompt_id is None:
+                self._anonymous_stage = "command"
+            else:
+                return False
+            return True
+        if not isinstance(prompt_id, str):
+            return False
+        if prompt_id not in self._prompt_ids:
+            return False
+        if _is_native_command_envelope(content):
+            return True
+        if _has_xml_envelope(content, "local-command-stdout"):
+            self._prompt_ids.discard(prompt_id)
+            return True
+        return False
+
+    def _consume_anonymous(self, content: str, prompt_id: object) -> bool:
+        stage = self._anonymous_stage
+        self._anonymous_stage = None
+        if prompt_id is not None:
+            return False
+        if stage == "command" and _is_native_command_envelope(content):
+            self._anonymous_stage = "stdout"
+            return True
+        return stage == "stdout" and _has_xml_envelope(content, "local-command-stdout")
+
+
 def parse_jsonl_line(raw: str) -> ParsedEvent | None:
     """Parse one jsonl line. Return None only on malformed json.
 
@@ -168,6 +221,8 @@ class ClaudeTranscriptParser:
     def __init__(self) -> None:
         self._turn_seq = 0
         self._turn_id: str | None = None
+        self._local_commands = _LegacyLocalCommandTracker()
+        self._boundary_local_commands = _LegacyLocalCommandTracker()
         self._pending_end_turn_request: str | None = None
         self._pending_terminal_request: str | None = None
         self._pending_terminal_text = ""
@@ -191,10 +246,13 @@ class ClaudeTranscriptParser:
             or self._ambiguous_completion
         )
 
-    @staticmethod
-    def is_turn_boundary(raw: str) -> bool:
+    def is_turn_boundary(self, raw: str) -> bool:
         data = _load_object(raw)
-        return data is not None and _is_top_level_user(data)
+        return (
+            data is not None
+            and not self._boundary_local_commands.consume(data)
+            and _is_top_level_user(data)
+        )
 
     def parse(self, raw: str) -> tuple[list[StreamEvent], str | None]:
         data = _load_object(raw)
@@ -205,7 +263,7 @@ class ClaudeTranscriptParser:
         sid = session_id if isinstance(session_id, str) else None
         event_type = data.get("type")
         if event_type == "user":
-            if not _is_top_level_user(data):
+            if self._local_commands.consume(data) or not _is_top_level_user(data):
                 return [], sid
             events = self.flush_pending_terminal()
             events.extend(self._close_unfinished_turn())
@@ -370,6 +428,23 @@ def _load_object(raw: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def _has_xml_envelope(content: str, tag: str) -> bool:
+    stripped = content.strip()
+    return stripped.startswith(f"<{tag}>") and stripped.endswith(f"</{tag}>")
+
+
+def _is_native_command_envelope(content: str) -> bool:
+    stripped = content.strip()
+    return (
+        stripped.startswith("<command-name>")
+        and "</command-name>" in stripped
+        and "<command-message>" in stripped
+        and "</command-message>" in stripped
+        and "<command-args>" in stripped
+        and stripped.endswith("</command-args>")
+    )
 
 
 def _is_top_level_user(data: dict[str, Any]) -> bool:

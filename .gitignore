@@ -30,6 +30,7 @@ logs/
 session_mapping.json
 channel_sessions.json
 tmux_sessions/
+.telegram-bot-tmux/
 data/
 .codex/.sync/
 

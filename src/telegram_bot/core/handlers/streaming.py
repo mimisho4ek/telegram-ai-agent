@@ -7,7 +7,7 @@ import contextlib
 import html
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from aiogram.enums import ChatType, ParseMode
@@ -360,8 +360,6 @@ class _StreamCtx:
     live_buffer: LiveStatusBuffer | None
     sent_message_ids: list[int]
     send_failed: bool = False
-    closed_turn_ids: set[str] = field(default_factory=set)
-    delivered_turn_ids: set[str] = field(default_factory=set)
 
 
 async def _send_status_silent(ctx: _StreamCtx, content: str) -> None:
@@ -722,7 +720,7 @@ async def send_streaming_response(
         sent_message_ids=sent_message_ids,
     )
 
-    async def _ensure_tmux_live_buffer() -> LiveStatusBuffer | None:
+    async def _ensure_tmux_live_buffer(turn_id: str | None) -> LiveStatusBuffer | None:
         if not ctx.used_tmux or ctx.tmux_manager is None:
             return ctx.live_buffer
         raw = ctx.tmux_manager.get_buffer(ctx.channel_key)
@@ -743,7 +741,7 @@ async def send_streaming_response(
             await ctx.tmux_manager.set_buffer(
                 ctx.channel_key,
                 buffer,
-                turn_id=None,
+                turn_id=turn_id,
             )
             return buffer
         except Exception:
@@ -763,15 +761,11 @@ async def send_streaming_response(
         else:
             buf = ctx.live_buffer
         if buf is None:
-            buf = await _ensure_tmux_live_buffer()
+            buf = await _ensure_tmux_live_buffer(event.turn_id)
         if buf is not None:
             await buf.append(html.escape(event.content))
 
     async def _close_turn_progress(turn_id: str | None) -> None:
-        token = turn_id or ""
-        if token in ctx.closed_turn_ids:
-            return
-        ctx.closed_turn_ids.add(token)
         if ctx.used_tmux and ctx.tmux_manager is not None:
             if ctx.tmux_manager.get_buffer(ctx.channel_key) is not None:
                 await ctx.tmux_manager.close_buffer(ctx.channel_key, turn_id)
@@ -823,20 +817,10 @@ async def send_streaming_response(
                 await _handle_text_event(ctx, event)
             return None
         if action == "final":
-            if event.turn_id and event.turn_id in ctx.delivered_turn_ids:
-                logger.warning(
-                    "Dropping duplicate final for channel=%s turn_id=%s",
-                    ctx.channel_key,
-                    event.turn_id,
-                )
-                return True
             await _close_turn_progress(event.turn_id)
             # A prior progress-send failure must not suppress the final.
             ctx.send_failed = False
-            delivered = await _handle_result_message_event(ctx, event)
-            if delivered and event.turn_id:
-                ctx.delivered_turn_ids.add(event.turn_id)
-            return delivered
+            return await _handle_result_message_event(ctx, event)
         return None
 
     async def _notify_engine_changed(new_engine: str) -> None:

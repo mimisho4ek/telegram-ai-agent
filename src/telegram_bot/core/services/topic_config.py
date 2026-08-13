@@ -42,7 +42,8 @@ Engine = Literal["claude", "codex"]
 _VALID_ENGINES: set[str] = {"claude", "codex"}
 _DEFAULT_ENGINE: Engine = "claude"
 _MODEL_OVERRIDE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
-_CORE_PROMPT_MODES: set[str] = {"task", "knowledge", "assistant", "free", "project", "blog"}
+_CORE_PROMPT_MODES: set[str] = {"task", "free"}
+_EXTRA_PROMPT_MODES: set[str] = set()
 
 _valid_modes_cache: tuple[int, set[str]] = (-1, set())
 
@@ -57,16 +58,28 @@ def _normalize_model(model: object) -> str | None:
     return normalized if _MODEL_OVERRIDE_RE.fullmatch(normalized) else None
 
 
+def register_prompt_modes(modes: set[str]) -> None:
+    """Register application-owned modes that have explicit prompt and tool policies."""
+    _EXTRA_PROMPT_MODES.update(modes)
+
+
 def _valid_modes() -> set[str]:
-    """A mode is valid if a matching prompts/<mode>.md currently exists on disk."""
+    """Return public modes plus registered application modes with prompt files."""
     global _valid_modes_cache
     try:
         mtime = _PROMPTS_DIR.stat().st_mtime_ns
     except OSError:
-        return _valid_modes_cache[1] | _CORE_PROMPT_MODES
-    if mtime != _valid_modes_cache[0]:
-        _valid_modes_cache = (mtime, {p.stem for p in _PROMPTS_DIR.glob("*.md")})
-    return _valid_modes_cache[1] | _CORE_PROMPT_MODES
+        prompt_modes = _valid_modes_cache[1]
+    else:
+        if mtime != _valid_modes_cache[0]:
+            _valid_modes_cache = (mtime, {p.stem for p in _PROMPTS_DIR.glob("*.md")})
+        prompt_modes = _valid_modes_cache[1]
+    return _CORE_PROMPT_MODES | (_EXTRA_PROMPT_MODES & prompt_modes)
+
+
+def is_prompt_mode_registered(mode: str) -> bool:
+    """Return whether a mode is available to the current application."""
+    return mode in _valid_modes()
 
 
 @dataclass
@@ -75,7 +88,7 @@ class TopicSettings:
 
     name: str
     type: str  # "assistant" | "project"
-    mode: str  # "task" | "knowledge" | "assistant" | "free" | "project"
+    mode: str  # public "free"/"task" or an application-registered mode
     cwd: str | None  # None → Settings.default_cwd
     mcp_config: str | None  # None → default (.mcp.bot.json)
     stream_mode: StreamMode = _DEFAULT_STREAM_MODE

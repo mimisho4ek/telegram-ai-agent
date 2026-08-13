@@ -172,15 +172,13 @@ def codex_npm_prefix() -> Path:
     return Path.home() / ".npm-global"
 
 
-# App vars agent sessions need at runtime (e.g. vault-link-tg requires
-# CADDY_DOMAIN). Secrets/tokens stay excluded: MCP servers load them
-# themselves via their start.sh.
-_CODEX_APP_ENV = (
-    "CADDY_DOMAIN",
-    "VAULT_PATH",
-    "VAULT_ROOTS",
+# Non-secret application paths needed by the reusable runtime. Applications
+# can register additional non-secret names without putting their behavior in core.
+_AGENT_APP_ENV = {
+    "APP_ROOT",
+    "AGENT_WORKSPACE_ROOT",
     "PROJECT_ROOT",
-)
+}
 
 _CODEX_ENV_ALLOWLIST = {
     "HOME",
@@ -195,8 +193,43 @@ _CODEX_ENV_ALLOWLIST = {
     "COLORTERM",
     "NO_COLOR",
     "TERM",
-    *_CODEX_APP_ENV,
+    "TMUX_TMPDIR",
+    *_AGENT_APP_ENV,
 }
+
+
+def extend_agent_env_allowlist(names: set[str]) -> None:
+    """Allow application-owned, non-secret variables in launched agent processes."""
+    _AGENT_APP_ENV.update(names)
+    _CODEX_ENV_ALLOWLIST.update(names)
+
+
+def agent_process_env(
+    *,
+    binary: str | Path | None = None,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build the non-secret environment shared by bot-launched agents."""
+    source = os.environ if base_env is None else base_env
+    env = {key: value for key, value in source.items() if key in _CODEX_ENV_ALLOWLIST}
+    if binary is not None:
+        bin_dir = Path(binary).expanduser().parent
+        current_path = env.get("PATH", os.defpath)
+        env["PATH"] = os.pathsep.join(
+            dict.fromkeys(
+                [str(bin_dir), *(part for part in current_path.split(os.pathsep) if part)]
+            )
+        )
+    env.pop("NPM_CONFIG_PREFIX", None)
+    env.setdefault("HOME", str(Path.home()))
+    env.setdefault("TERM", "xterm-256color")
+    return env
+
+
+def agent_env_prefix(*, binary: str | Path | None = None) -> list[str]:
+    """Return an ``env -i`` prefix for tmux-launched agent processes."""
+    env = agent_process_env(binary=binary)
+    return ["env", "-i", *(f"{key}={value}" for key, value in sorted(env.items()))]
 
 
 def codex_process_env(
@@ -206,19 +239,18 @@ def codex_process_env(
     minimal: bool = True,
 ) -> dict[str, str]:
     """Build a constrained process env for bot-spawned Codex commands."""
-    source = os.environ if base_env is None else base_env
-    if minimal:
-        env = {key: value for key, value in source.items() if key in _CODEX_ENV_ALLOWLIST}
-    else:
-        env = dict(source)
     binary = Path(codex_bin).expanduser() if codex_bin is not None else Path(CODEX_ADAPTER.binary())
-    bin_dir = binary.expanduser().parent
-    current_path = env.get("PATH", os.defpath)
-    path_parts = [str(bin_dir), *(part for part in current_path.split(os.pathsep) if part)]
-    env["PATH"] = os.pathsep.join(dict.fromkeys(path_parts))
-    env.pop("NPM_CONFIG_PREFIX", None)
-    env.setdefault("HOME", str(Path.home()))
-    env.setdefault("TERM", "xterm-256color")
+    if minimal:
+        env = agent_process_env(binary=binary, base_env=base_env)
+    else:
+        env = dict(os.environ if base_env is None else base_env)
+        current_path = env.get("PATH", os.defpath)
+        env["PATH"] = os.pathsep.join(
+            dict.fromkeys([str(binary.expanduser().parent), *current_path.split(os.pathsep)])
+        )
+        env.pop("NPM_CONFIG_PREFIX", None)
+        env.setdefault("HOME", str(Path.home()))
+        env.setdefault("TERM", "xterm-256color")
     if _use_codex_bot_home():
         _ensure_codex_global_skill_links()
         env["CODEX_HOME"] = str(_CODEX_BOT_HOME)
@@ -242,7 +274,7 @@ def codex_env_prefix(*, codex_bin: str | Path | None = None) -> list[str]:
         "COLORTERM",
         "NO_COLOR",
         "TERM",
-        *_CODEX_APP_ENV,
+        *_AGENT_APP_ENV,
     ]
     ordered_keys = [*inherited_keys, *keys]
     return ["env", "-i", *(f"{key}={env[key]}" for key in ordered_keys if key in env)]
@@ -432,15 +464,26 @@ class CodexAdapter:
         return cls._normalize_prompt_for_match(value) == cls._normalize_prompt_for_match(prompt)
 
     @classmethod
+    def _tui_user_message_text(cls, data: dict[str, Any]) -> str | None:
+        if data.get("type") != "event_msg":
+            return None
+        payload = data.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("type") == "user_message":
+            return cls._message_text_from_payload(payload)
+        if payload.get("type") != "item_completed":
+            return None
+        item = payload.get("item")
+        if not isinstance(item, dict) or item.get("type") != "UserMessage":
+            return None
+        return cls._message_text_from_payload(item)
+
+    @classmethod
     def _has_prompt_user_message(cls, records: list[dict[str, Any]], prompt: str) -> int:
         matches = 0
         for data in records:
-            if data.get("type") != "event_msg":
-                continue
-            payload = data.get("payload")
-            if not isinstance(payload, dict) or payload.get("type") != "user_message":
-                continue
-            if cls._prompts_match(payload.get("message"), prompt):
+            if cls._prompts_match(cls._tui_user_message_text(data), prompt):
                 matches += 1
         return matches
 
@@ -701,16 +744,42 @@ class CodexAdapter:
                     {"command": command} if isinstance(command, str) else None,
                 )
                 return TuiParseResult([StreamEvent("status", f"{status} (exit {exit_code})")])
+            if ptype == "item_completed":
+                item = payload.get("item")
+                if not isinstance(item, dict):
+                    return TuiParseResult([])
+                item_type = item.get("type")
+                if item_type == "AgentMessage":
+                    message = self._message_text_from_payload(item)
+                    if not message:
+                        return TuiParseResult([])
+                    if item.get("phase") == "final_answer":
+                        return TuiParseResult([StreamEvent("result_message", message)])
+                    return TuiParseResult([StreamEvent("text", message)])
+                if item_type == "CommandExecution":
+                    exit_code = item.get("exit_code")
+                    if not isinstance(exit_code, int) or exit_code == 0:
+                        return TuiParseResult([])
+                    command = self._command_from_exec_payload(item)
+                    status = _tool_status(
+                        "Bash",
+                        {"command": command} if isinstance(command, str) else None,
+                    )
+                    return TuiParseResult([StreamEvent("status", f"{status} (exit {exit_code})")])
             if ptype == "task_complete":
                 return TuiParseResult([StreamEvent("result", "")], done=True)
 
         if (
             event_type == "response_item"
             and isinstance(payload, dict)
-            and payload.get("type") == "function_call"
+            and payload.get("type") in {"function_call", "custom_tool_call"}
         ):
             name = payload.get("name", "")
-            args = payload.get("arguments")
+            args = (
+                payload.get("arguments")
+                if payload.get("type") == "function_call"
+                else payload.get("input")
+            )
             tool_input: dict[str, object] | None = None
             if isinstance(args, str):
                 parsed_args = _load_json(args)
@@ -931,6 +1000,14 @@ class CodexTranscriptParser:
             self._completed_final_seen = False
             events.append(StreamEvent("turn_start", "", turn_id=raw_turn_id))
             return TuiParseResult(events)
+
+        if self._adapter._tui_user_message_text(data) is not None and self._turn_id is not None:
+            # Codex keeps a clarification in the current native turn even
+            # after emitting a final_answer. Reopen exactly one final window
+            # without inventing another lifecycle turn.
+            if self._final_seen:
+                self._final_seen = False
+            return TuiParseResult([])
 
         if (
             data.get("type") == "event_msg"

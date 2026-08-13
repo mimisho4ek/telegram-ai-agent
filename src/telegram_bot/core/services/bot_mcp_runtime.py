@@ -37,7 +37,11 @@ def _standard_bot_server(project_root: Path) -> dict[str, Any]:
     return {
         "command": "bash",
         "args": [str(project_root / "mcp-servers" / "bot" / "start.sh")],
-        "env": {"PROJECT_DIR": str(project_root)},
+        "env": {
+            "APP_ROOT": str(project_root),
+            "ENV_FILE": str(project_root / ".env"),
+            "PROJECT_DIR": str(project_root),
+        },
     }
 
 
@@ -111,6 +115,8 @@ def ensure_bot_runtime_mcp_config(
     raw_env = bot_server.get("env")
     env = dict(raw_env) if isinstance(raw_env, dict) else {}
     env.update(common_env)
+    env.setdefault("APP_ROOT", str(root))
+    env.setdefault("ENV_FILE", str(root / ".env"))
     env.setdefault("PROJECT_DIR", str(root))
     env["TELEGRAM_CHAT_ID"] = str(channel_key[0])
     env["TELEGRAM_THREAD_ID"] = "" if channel_key[1] is None else str(channel_key[1])

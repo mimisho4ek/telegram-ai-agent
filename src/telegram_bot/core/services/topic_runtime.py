@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from telegram_bot.core.services.cc_modes import Mode
-from telegram_bot.core.services.topic_config import Engine, ExecMode, StreamMode, TopicSettings
+from telegram_bot.core.services.topic_config import (
+    Engine,
+    ExecMode,
+    StreamMode,
+    TopicSettings,
+    is_prompt_mode_registered,
+)
 
 
 @dataclass(frozen=True)
@@ -40,11 +46,7 @@ def resolve_topic_runtime_config(
     mcp_config = (
         settings.mcp_config if settings.mcp_config is not None else str(defaults.mcp_config)
     )
-    mode = (
-        settings.mode
-        if settings.mode in {"task", "knowledge", "assistant", "free", "blog", "project"}
-        else defaults.mode
-    )
+    mode = settings.mode if is_prompt_mode_registered(settings.mode) else defaults.mode
     engine = settings.engine or defaults.engine
     models = settings.models if isinstance(settings.models, dict) else {}
     model = models.get(engine)
@@ -52,7 +54,7 @@ def resolve_topic_runtime_config(
         model = settings.model if settings.model is not None else defaults.model
     return TopicRuntimeConfig(
         cwd=cwd,
-        mode=mode,  # type: ignore[arg-type]
+        mode=mode,
         mcp_config=mcp_config,
         engine=engine,
         model=model,

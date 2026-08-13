@@ -11,6 +11,11 @@ The bot runtime is split into:
   image galleries, and files back to Telegram.
 - `src/telegram_bot/prompts/` - generic public prompt modes.
 
+The reusable core registers only the public `free` and `task` prompt modes.
+An application that embeds the core must register any additional prompt mode
+and its complete tool policy outside `src/telegram_bot/core/`; adding a prompt
+file alone does not make a mode runnable.
+
 Two independent runtime axes are important:
 
 - `engine`: `claude` or `codex`.
@@ -48,6 +53,18 @@ https://core.telegram.org/type/RichText.
 
 Forum topics are isolated by `(chat_id, thread_id)`. Session mappings and tmux
 state are runtime files and must not be committed.
+
+The public entrypoint uses a workspace-local, mode-0700 tmux server directory
+when `TMUX_TMPDIR` is not configured. On the first upgraded start it migrates
+only state-owned bot sessions from the legacy default server, leaving unrelated
+tmux sessions untouched.
+
+The standard installation uses one `PROJECT_ROOT`. Advanced installations may
+split immutable application code (`APP_ROOT`) from editable projects and
+runtime state (`AGENT_WORKSPACE_ROOT`). Relative topic config, session mapping,
+tmux, cache, generated runtime MCP configs, and default-cwd paths resolve under
+the workspace root. MCP launchers and optional base MCP profiles resolve under
+the application root.
 
 Long-lived tmux runtimes generate topic-scoped MCP runtime configs. These
 configs tag child processes with non-secret runtime metadata so `/kill`,

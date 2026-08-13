@@ -57,7 +57,11 @@ from telegram_bot.core.messages import t
 from telegram_bot.core.services.bot_mcp_runtime import ensure_bot_runtime_mcp_config
 from telegram_bot.core.services.claude import Mode, StreamEvent
 from telegram_bot.core.services.process_cleanup import cleanup_tmux_runtime, runtime_diagnostics
-from telegram_bot.core.services.providers import CODEX_ADAPTER, CodexTranscriptSnapshot
+from telegram_bot.core.services.providers import (
+    CODEX_ADAPTER,
+    CodexTranscriptSnapshot,
+    agent_env_prefix,
+)
 from telegram_bot.core.services.tail_runner import TailRunner
 from telegram_bot.core.services.tmux_modal_watchdog import (
     ModalWatchdog,
@@ -97,6 +101,7 @@ from telegram_bot.core.services.tmux_spawn import (
 )
 from telegram_bot.core.services.tmux_spawn import (
     make_session_name,
+    sanitized_tmux_environment,
     spawn_tmux_sync,
 )
 from telegram_bot.core.services.tmux_spawn import (
@@ -903,6 +908,9 @@ class TmuxManager:
         spawn_start = time.monotonic()
         deadline = spawn_start + _SPAWN_READINESS_BUDGET_SEC
 
+        sanitized_startup = startup_cmd
+        if startup_cmd[:2] != ["env", "-i"]:
+            sanitized_startup = [*agent_env_prefix(binary=startup_cmd[0]), *startup_cmd]
         new_session_argv = [
             "tmux",
             "new-session",
@@ -913,10 +921,19 @@ class TmuxManager:
             "200",
             "-y",
             "50",
-            *startup_cmd,
+            *sanitized_startup,
         ]
+        tmux_env = await asyncio.to_thread(
+            sanitized_tmux_environment,
+            run=subprocess.run,
+        )
         result = await asyncio.to_thread(
-            subprocess.run, new_session_argv, capture_output=True, text=True, cwd=cwd
+            subprocess.run,
+            new_session_argv,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            env=tmux_env,
         )
         if result.returncode != 0:
             stderr = result.stderr.strip()
@@ -936,6 +953,7 @@ class TmuxManager:
                     capture_output=True,
                     text=True,
                     cwd=cwd,
+                    env=tmux_env,
                 )
                 stderr = result.stderr.strip()
             if result.returncode != 0:
@@ -3267,15 +3285,19 @@ class TmuxManager:
         self,
         session_manager: object | None = None,
     ) -> tuple[str | None, str | Path | None]:
-        project_root = None
+        application_root = None
         default_mcp: str | None = None
         if session_manager is not None:
             settings = getattr(session_manager, "_settings", None)
-            project_root = getattr(settings, "project_root", None)
+            application_root = getattr(settings, "app_root_path", None)
+            if not isinstance(application_root, str | Path):
+                application_root = getattr(settings, "app_root", None) or getattr(
+                    settings, "project_root", None
+                )
             default_getter = getattr(session_manager, "default_mcp_config_path", None)
             if callable(default_getter):
                 default_mcp = str(default_getter())
-        return default_mcp, project_root
+        return default_mcp, application_root
 
     def _effective_base_mcp_config(
         self,
