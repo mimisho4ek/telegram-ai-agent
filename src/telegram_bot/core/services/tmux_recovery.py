@@ -221,9 +221,13 @@ def restore_all(
             is_codex_tui = rv == "codex-tui-v1" and state.provider == "codex"
             is_supported_tui = is_claude_tui or is_codex_tui
 
-            if alive and is_supported_tui and tmux_pane_inherits_disallowed_environment(
-                state.session_name,
-                run=_tm.subprocess.run,  # type: ignore[attr-defined]
+            if (
+                alive
+                and is_supported_tui
+                and tmux_pane_inherits_disallowed_environment(
+                    state.session_name,
+                    run=_tm.subprocess.run,  # type: ignore[attr-defined]
+                )
             ):
                 logger.warning(
                     "Restarting legacy tmux session %s with a sanitized environment",

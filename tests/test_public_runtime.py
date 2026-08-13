@@ -450,7 +450,7 @@ def test_claude_local_command_records_do_not_open_a_turn() -> None:
     boundary_parser = ClaudeTranscriptParser()
     records = [
         (
-            '<local-command-caveat>Local command metadata.</local-command-caveat>',
+            "<local-command-caveat>Local command metadata.</local-command-caveat>",
             True,
         ),
         (
