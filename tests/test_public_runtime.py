@@ -662,6 +662,15 @@ def test_research_policy_and_marker_parser_are_strict() -> None:
     assert research_request_reason(f"prefix {RESEARCH_PERMISSION_MARKER}") is None
 
 
+def test_codex_tui_transcript_discovery_uses_delivered_prompt() -> None:
+    source = Path("src/telegram_bot/core/services/tmux_manager.py").read_text(encoding="utf-8")
+    call_start = source.index("await self._locate_codex_transcript_after_send(")
+    call_end = source.index("\n                        )", call_start)
+
+    assert "prompt=effective_prompt" in source[call_start:call_end]
+    assert "prompt=prompt" not in source[call_start:call_end]
+
+
 def test_codex_tui_web_search_is_explicit_and_opt_in(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         "telegram_bot.core.services.providers.discover_codex_mcp_server_names",

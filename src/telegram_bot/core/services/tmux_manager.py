@@ -2521,7 +2521,10 @@ class TmuxManager:
                         await self._locate_codex_transcript_after_send(
                             state,
                             snapshot=codex_snapshot,
-                            prompt=prompt,
+                            # Discovery must match the exact text written by
+                            # Codex. The research policy wrapper is part of the
+                            # delivered TUI message when web access is disabled.
+                            prompt=effective_prompt,
                         )
                     except RuntimeError:
                         logger.warning(
