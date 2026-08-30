@@ -335,7 +335,12 @@ class ProviderAdapter(Protocol):
     def parse_exec_event(self, raw: str) -> ExecParseResult: ...
 
     def build_tui_start(
-        self, *, cwd: str, model: str | None = None, mcp_config: str | None = None
+        self,
+        *,
+        cwd: str,
+        model: str | None = None,
+        mcp_config: str | None = None,
+        web_search: bool = False,
     ) -> list[str]: ...
 
     def build_tui_resume(
@@ -345,6 +350,7 @@ class ProviderAdapter(Protocol):
         session_id: str,
         model: str | None = None,
         mcp_config: str | None = None,
+        web_search: bool = False,
     ) -> list[str]: ...
 
     def parse_tui_event(self, raw: str) -> TuiParseResult: ...
@@ -662,7 +668,12 @@ class CodexAdapter:
         return ExecParseResult([])
 
     def build_tui_start(
-        self, *, cwd: str, model: str | None = None, mcp_config: str | None = None
+        self,
+        *,
+        cwd: str,
+        model: str | None = None,
+        mcp_config: str | None = None,
+        web_search: bool = False,
     ) -> list[str]:
         codex_home = _CODEX_BOT_HOME if _use_codex_bot_home() else _CODEX_HOME
         inherited_servers = discover_codex_mcp_server_names(cwd, codex_home=codex_home)
@@ -673,6 +684,8 @@ class CodexAdapter:
                 mcp_config,
                 inherited_server_names=inherited_servers,
             ),
+            "-c",
+            f'web_search="{"live" if web_search else "disabled"}"',
             "--no-alt-screen",
             "--dangerously-bypass-approvals-and-sandbox",
             "--cd",
@@ -689,6 +702,7 @@ class CodexAdapter:
         session_id: str,
         model: str | None = None,
         mcp_config: str | None = None,
+        web_search: bool = False,
     ) -> list[str]:
         codex_home = _CODEX_BOT_HOME if _use_codex_bot_home() else _CODEX_HOME
         inherited_servers = discover_codex_mcp_server_names(cwd, codex_home=codex_home)
@@ -700,6 +714,8 @@ class CodexAdapter:
                 mcp_config,
                 inherited_server_names=inherited_servers,
             ),
+            "-c",
+            f'web_search="{"live" if web_search else "disabled"}"',
             session_id,
             "--no-alt-screen",
             "--dangerously-bypass-approvals-and-sandbox",

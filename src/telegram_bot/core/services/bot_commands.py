@@ -41,6 +41,11 @@ PUBLIC_BOT_COMMANDS: tuple[LocalizedBotCommand, ...] = (
     LocalizedBotCommand("stream", "Выбрать режим ответов", "Choose response mode"),
     LocalizedBotCommand("engine", "Выбрать Claude Code или Codex", "Choose Claude Code or Codex"),
     LocalizedBotCommand("codex_update", "Обновить Codex CLI", "Update Codex CLI"),
+    LocalizedBotCommand(
+        "research",
+        "Разрешить веб-поиск для следующей задачи",
+        "Allow web search for the next task",
+    ),
     LocalizedBotCommand("resume", "Возобновить сохраненную сессию", "Resume a saved session"),
     LocalizedBotCommand("kill", "Остановить tmux-сессию", "Stop the tmux session"),
     LocalizedBotCommand("recycle", "Перезапустить runtime топика", "Restart topic runtime"),

@@ -36,6 +36,7 @@ from telegram_bot.core.services.claude import SessionManager
 from telegram_bot.core.services.codex_update import CodexUpdateService
 from telegram_bot.core.services.message_queue import MessageQueue
 from telegram_bot.core.services.picker_store import PickerStore
+from telegram_bot.core.services.research_grants import ResearchGrantStore
 from telegram_bot.core.services.tmux_manager import TmuxManager
 from telegram_bot.core.services.topic_config import TopicConfig
 from telegram_bot.core.services.topic_runtime import BotDefaults
@@ -194,8 +195,10 @@ async def _start() -> None:
     tmux_sessions_dir = settings.resolve_workspace_path(settings.tmux_sessions_dir)
     _ensure_dedicated_tmux_tmpdir(workspace_root, tmux_sessions_dir)
     topic_config = TopicConfig(str(topic_config_path), str(workspace_root))
+    research_grants = ResearchGrantStore()
     tmux_manager = TmuxManager(
         sessions_dir=tmux_sessions_dir,
+        research_grants=research_grants,
     )
     codex_update_service = CodexUpdateService(
         state_path=tmux_sessions_dir / "codex_update.json",
@@ -205,7 +208,11 @@ async def _start() -> None:
     )
     tmux_manager.wire_codex_update_service(codex_update_service)
     tmux_manager.wire_live_buffer(bot=bot, topic_config=topic_config)
-    session_manager = SessionManager(settings, topic_config=topic_config)
+    session_manager = SessionManager(
+        settings,
+        topic_config=topic_config,
+        research_grants=research_grants,
+    )
     tmux_manager.restore_all(session_manager)
     picker_store = PickerStore()
     bot_defaults = BotDefaults(
@@ -263,6 +270,7 @@ async def _start() -> None:
     dp["tmux_manager"] = tmux_manager
     dp["codex_update_service"] = codex_update_service
     dp["picker_store"] = picker_store
+    dp["research_grants"] = research_grants
     dp["bot_defaults"] = bot_defaults
 
     ensure_tmp_dir(session_manager.file_cache_dir)

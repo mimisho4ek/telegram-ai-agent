@@ -62,6 +62,7 @@ from telegram_bot.core.services.providers import (
     CodexTranscriptSnapshot,
     agent_env_prefix,
 )
+from telegram_bot.core.services.research_grants import ResearchGrantStore
 from telegram_bot.core.services.tail_runner import TailRunner
 from telegram_bot.core.services.tmux_modal_watchdog import (
     ModalWatchdog,
@@ -247,9 +248,11 @@ class TmuxManager:
         sessions_dir: Path,
         *,
         session_name_prefix: str = "cc-",
+        research_grants: ResearchGrantStore | None = None,
     ) -> None:
         self._sessions_dir = sessions_dir
         self._session_name_prefix = session_name_prefix
+        self._research_grants = research_grants
         self._sessions: dict[ChannelKey, TmuxSessionState] = {}
         self._cancel_events: dict[ChannelKey, asyncio.Event] = {}
         self._is_processing: dict[ChannelKey, bool] = {}
@@ -519,6 +522,10 @@ class TmuxManager:
         state = self._sessions[channel_key]
         return self._tmux_alive(state.session_name)
 
+    def is_research_enabled(self, channel_key: ChannelKey) -> bool:
+        state = self._sessions.get(channel_key)
+        return bool(state and state.provider == "codex" and state.web_search_enabled)
+
     def active_session_count(self) -> int:
         """Number of channels with a tracked tmux session.
 
@@ -722,6 +729,11 @@ class TmuxManager:
             session_manager=session_manager,
         )
         transcript_abs: str | None = None
+        web_search_enabled = bool(
+            provider == "codex"
+            and self._research_grants
+            and self._research_grants.consume(channel_key)
+        )
         if provider == "codex":
             if resume_session_id is None:
                 await self._maybe_auto_update_codex(channel_key)
@@ -732,6 +744,7 @@ class TmuxManager:
                     session_id=resume_session_id,
                     model=model,
                     mcp_config=mcp_config,
+                    web_search=web_search_enabled,
                 )
                 current_state = self._sessions.get(channel_key)
                 saved_path = CODEX_ADAPTER.transcript_path_for_state(
@@ -747,6 +760,7 @@ class TmuxManager:
                     cwd=cwd,
                     model=model,
                     mcp_config=mcp_config,
+                    web_search=web_search_enabled,
                 )
                 initial_offset = 0
         elif resume_session_id is not None:
@@ -785,6 +799,7 @@ class TmuxManager:
             model=model,
             transcript_path=transcript_abs,
             base_mcp_config=base_mcp_config,
+            web_search_enabled=web_search_enabled,
         )
 
         # User-facing loading status: codex/claude TUI cold-start can take
@@ -2397,6 +2412,8 @@ class TmuxManager:
         channel_key: ChannelKey,
         prompt: str,
         on_event: Callable[[StreamEvent], Awaitable[bool | None] | bool | None],
+        *,
+        session_manager: object | None = None,
     ) -> str:
         """Send user message to persistent CC TUI and tail transcript until done.
 
@@ -2519,6 +2536,14 @@ class TmuxManager:
             if self._cancel_events.get(channel_key) is cancel_event:
                 self._cancel_events.pop(channel_key, None)
             self.clear_processing(channel_key)
+            current = self._sessions.get(channel_key)
+            if (
+                session_manager is not None
+                and current is not None
+                and current.provider == "codex"
+                and current.web_search_enabled
+            ):
+                await self.disable_research(channel_key, session_manager)
 
     async def cancel(self, channel_key: ChannelKey) -> None:
         """Interrupt CC processing and cancel the tail loop.
@@ -2975,7 +3000,7 @@ class TmuxManager:
         Unlike `/new`, this does not intentionally reset conversation state.
         It resumes when the provider has a known session id; Codex sessions
         without discovered ids are restarted fresh because there is nothing
-        reliable to resume.
+                reliable to resume.
         """
         async with self._get_channel_lock(channel_key):
             state = self._sessions.get(channel_key)
@@ -3009,12 +3034,14 @@ class TmuxManager:
                         session_id=resume_id,
                         model=candidate.model,
                         mcp_config=candidate.mcp_config,
+                        web_search=candidate.web_search_enabled,
                     )
                 else:
                     startup_cmd = CODEX_ADAPTER.build_tui_start(
                         cwd=candidate.cwd,
                         model=candidate.model,
                         mcp_config=candidate.mcp_config,
+                        web_search=candidate.web_search_enabled,
                     )
             elif resume_id:
                 startup_cmd = session_manager.build_tmux_startup_args(  # type: ignore[attr-defined]
@@ -3068,6 +3095,37 @@ class TmuxManager:
                 "Recycled tmux session %s for channel %s", candidate.session_name, channel_key
             )
             return True
+
+    async def enable_research(self, channel_key: ChannelKey, session_manager: object) -> bool:
+        """Restart a live Codex TUI with web search enabled for its next turn."""
+        state = self._sessions.get(channel_key)
+        if state is None or state.provider != "codex" or not self.is_active(channel_key):
+            return False
+        state.web_search_enabled = True
+        self._save_state()
+        try:
+            return await self.recycle(channel_key, session_manager)
+        except Exception:
+            state = self._sessions.get(channel_key)
+            if state is not None:
+                state.web_search_enabled = False
+                self._save_state()
+            raise
+
+    async def disable_research(self, channel_key: ChannelKey, session_manager: object) -> None:
+        """Fail closed after a one-shot research turn, preserving conversation state."""
+        state = self._sessions.get(channel_key)
+        if state is None or state.provider != "codex" or not state.web_search_enabled:
+            return
+        state.web_search_enabled = False
+        self._save_state()
+        try:
+            await self.recycle(channel_key, session_manager)
+        except Exception:
+            logger.exception("Failed to restart Codex without web search for %s", channel_key)
+            # Do not leave a live TUI with research permission after a reset
+            # failure. The next normal message will lazily start disabled.
+            await self.kill(channel_key)
 
     async def _kill_session_unlocked(self, channel_key: ChannelKey) -> None:
         # Cancel tail loop first so send_stream unblocks. Unlocked variant —

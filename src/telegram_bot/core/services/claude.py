@@ -57,6 +57,7 @@ from telegram_bot.core.services.providers import (
     claude_binary,
     codex_process_env,
 )
+from telegram_bot.core.services.research_grants import ResearchGrantStore
 from telegram_bot.core.services.topic_runtime import BotDefaults, resolve_topic_runtime_config
 from telegram_bot.core.types import ChannelKey
 
@@ -162,9 +163,11 @@ class SessionManager:
         self,
         settings: Settings,
         topic_config: TopicConfig | None = None,
+        research_grants: ResearchGrantStore | None = None,
     ) -> None:
         self._settings = settings
         self._topic_config = topic_config
+        self._research_grants = research_grants
         self._sessions: dict[ChannelKey, SessionData] = {}
         self._cleanup_task: asyncio.Task[None] | None = None
         self._msg_sessions: collections.OrderedDict[int, object] = collections.OrderedDict()
@@ -490,6 +493,14 @@ class SessionManager:
             session.mcp_config,
             inherited_server_names=inherited_servers,
         )
+        web_search = bool(
+            self._research_grants
+            and self._research_grants.consume((session.chat_id, session.thread_id))
+        )
+        web_search_args = [
+            "-c",
+            f'web_search="{"live" if web_search else "disabled"}"',
+        ]
 
         if session.session_id:
             argv = [
@@ -497,6 +508,7 @@ class SessionManager:
                 "exec",
                 "resume",
                 *mcp_args,
+                *web_search_args,
                 session.session_id,
                 "--json",
                 "--skip-git-repo-check",
@@ -510,6 +522,7 @@ class SessionManager:
                 CODEX_ADAPTER.binary(),
                 "exec",
                 *mcp_args,
+                *web_search_args,
                 "--json",
                 "--cd",
                 cwd,

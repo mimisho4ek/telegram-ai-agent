@@ -143,6 +143,7 @@ def build_resume_startup_cmd(
     mcp_config: str | None,
     model: str | None,
     session_manager: object,
+    web_search: bool = False,
 ) -> list[str]:
     """Build provider-specific TUI resume argv."""
     if provider == "codex":
@@ -151,6 +152,7 @@ def build_resume_startup_cmd(
             session_id=session_id,
             model=model,
             mcp_config=mcp_config,
+            web_search=web_search,
         )
     return cast(
         list[str],
@@ -221,6 +223,20 @@ def restore_all(
             is_codex_tui = rv == "codex-tui-v1" and state.provider == "codex"
             is_supported_tui = is_claude_tui or is_codex_tui
 
+            if alive and is_codex_tui and state.web_search_enabled:
+                logger.warning(
+                    "Restarting one-shot research session %s with web search disabled",
+                    state.session_name,
+                )
+                _tm.subprocess.run(  # type: ignore[attr-defined]
+                    ["tmux", "kill-session", "-t", f"={state.session_name}"],
+                    capture_output=True,
+                    check=False,
+                    env=sanitized_tmux_environment(run=_tm.subprocess.run),  # type: ignore[attr-defined]
+                )
+                state.web_search_enabled = False
+                alive = False
+
             if (
                 alive
                 and is_supported_tui
@@ -289,6 +305,7 @@ def restore_all(
                     mcp_config=state.mcp_config,
                     model=state.model,
                     session_manager=session_manager,
+                    web_search=False,
                 )
                 if not spawn_tmux_sync(
                     name=state.session_name,

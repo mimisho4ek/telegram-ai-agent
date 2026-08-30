@@ -403,6 +403,9 @@ Slash commands устроены отдельно: в tmux topics non-bot command
   cooldown, но блокируется другим bot-managed обновлением в этом процессе или
   bot-managed активными Codex sessions. `/codex_update status` показывает
   последний redacted result.
+- `/research`: разрешить Codex живой веб-поиск только для следующей задачи.
+  `/research status` показывает состояние допуска, `/research off` отзывает
+  его. Во всех остальных запусках Codex поиск явно выключен.
 - `/stream`: только forum topics; выбрать `verbose`, `live` или `minimal`.
 - `/resume`: только forum topics; возобновить сохраненную tmux session для cwd
   текущего topic.
@@ -526,6 +529,11 @@ low-privilege Linux user. Если bot token утек, перевыпустит�
 ограниченным окружением и не наследуют bot tokens и посторонние credentials.
 По умолчанию бот также использует отдельный workspace-local tmux server и при
 обновлении переносит со старого сервера только собственные сохранённые сессии.
+
+Встроенный веб-поиск Codex по умолчанию выключен, а `/research` разрешает его
+на одну задачу. Это не сетевой firewall уровня ОС: поскольку у агента остаётся
+доступ к shell, команды вроде `curl` надо отдельно ограничить контейнером или
+firewall, если нужен жёсткий запрет всего исходящего трафика.
 
 ## Development
 

@@ -399,6 +399,9 @@ still exists as a legacy alias, but `/clear` is the command shown in the menu.
   cooldown but is blocked by another bot-managed update in this process or
   bot-managed active Codex sessions. `/codex_update status` shows the last
   redacted result.
+- `/research`: allow Codex live web search for the next task only. Use
+  `/research status` to inspect the permission or `/research off` to revoke it.
+  Search is explicitly disabled for every other Codex launch.
 - `/stream`: forum topics only; choose `verbose`, `live`, or `minimal`.
 - `/resume`: forum topics only; resume a saved tmux session for the current
   topic working directory.
@@ -521,6 +524,12 @@ Values loaded from `.env` are treated as opaque strings, so token text such as
 environment: bot tokens and unrelated service credentials are not inherited.
 The bot also uses a dedicated workspace-local tmux server by default and
 migrates only its own persisted sessions from older installations.
+
+Codex's built-in web search is disabled by default and `/research` grants it
+for one task. This is not an operating-system network firewall: because the
+agent otherwise retains shell access, outbound commands such as `curl` must be
+restricted separately with container/firewall policy if you need a hard ban on
+all network traffic.
 
 ## Development
 

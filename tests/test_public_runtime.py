@@ -19,16 +19,19 @@ from telegram_bot.core.services.providers import (
     agent_process_env,
     choose_available_engine,
 )
+from telegram_bot.core.services.research_grants import ResearchGrantStore
 from telegram_bot.core.services.rich_sender import detect_rich_send
 from telegram_bot.core.services.tmux_spawn import (
     sanitized_tmux_environment,
     tmux_pane_inherits_disallowed_environment,
 )
+from telegram_bot.core.services.tmux_state import parse_state_entry
 from telegram_bot.core.services.topic_config import (
     TopicConfig,
     TopicSettings,
 )
 from telegram_bot.core.services.topic_runtime import BotDefaults, resolve_topic_runtime_config
+from telegram_bot.core.tui.routing import route_slash_command
 from telegram_bot.core.tui.transcript import ClaudeTranscriptParser
 
 
@@ -484,6 +487,7 @@ def test_public_command_handlers_are_wired() -> None:
     assert commands.handle_engine_command is not None
     assert commands.handle_recycle is not None
     assert commands.handle_mcpstatus is not None
+    assert commands.handle_research is not None
     assert handle_tail_command is not None
 
 
@@ -492,12 +496,97 @@ def test_public_bot_command_menu_is_public_only() -> None:
 
     assert "clear" in command_names
     assert "codex_update" in command_names
+    assert "research" in command_names
     assert "recycle" in command_names
     assert "mcpstatus" in command_names
     assert "tui" in command_names
     assert "tail" in command_names
     assert "new" not in command_names
     assert "day" not in command_names
+
+
+def test_research_command_is_reserved_for_the_bot() -> None:
+    assert route_slash_command("/research") == "bot"
+    assert route_slash_command("/research status") == "bot"
+
+
+def test_research_grant_is_one_shot_and_process_local() -> None:
+    grants = ResearchGrantStore()
+    key = (123, 456)
+
+    assert grants.consume(key) is False
+    grants.arm(key)
+    assert grants.is_pending(key) is True
+    assert grants.consume(key) is True
+    assert grants.consume(key) is False
+    assert ResearchGrantStore().is_pending(key) is False
+
+
+def test_codex_tui_web_search_is_explicit_and_opt_in(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "telegram_bot.core.services.providers.discover_codex_mcp_server_names",
+        lambda *_args, **_kwargs: set(),
+    )
+
+    disabled = CODEX_ADAPTER.build_tui_start(cwd=str(tmp_path))
+    enabled = CODEX_ADAPTER.build_tui_start(cwd=str(tmp_path), web_search=True)
+
+    assert 'web_search="disabled"' in disabled
+    assert 'web_search="live"' in enabled
+
+    resumed = CODEX_ADAPTER.build_tui_resume(
+        cwd=str(tmp_path),
+        session_id="00000000-0000-0000-0000-000000000000",
+        web_search=True,
+    )
+    assert 'web_search="live"' in resumed
+
+
+def test_codex_subprocess_consumes_research_grant_once(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "telegram_bot.core.services.claude.discover_codex_mcp_server_names",
+        lambda *_args, **_kwargs: set(),
+    )
+    grants = ResearchGrantStore()
+    settings = Settings(
+        _env_file=None,
+        telegram_bot_token="test-token",
+        project_root=str(tmp_path),
+        default_cwd=".",
+        file_cache_dir="./data",
+    )
+    manager = SessionManager(settings, research_grants=grants)
+    key = (123, None)
+    session = manager._get_session(key)
+    session.engine = "codex"
+
+    disabled = manager._build_exec_command("first", session).argv
+    grants.arm(key)
+    enabled = manager._build_exec_command("second", session).argv
+    disabled_again = manager._build_exec_command("third", session).argv
+
+    assert 'web_search="disabled"' in disabled
+    assert 'web_search="live"' in enabled
+    assert 'web_search="disabled"' in disabled_again
+
+
+def test_legacy_tmux_state_defaults_web_search_to_disabled() -> None:
+    parsed = parse_state_entry(
+        {
+            "session_name": "cc-1-2",
+            "session_dir": "/tmp/cc-1-2",
+            "session_id": None,
+            "mode": "free",
+            "cwd": "/tmp",
+            "mcp_config": "",
+            "chat_id": 1,
+            "runner_version": "codex-tui-v1",
+            "provider": "codex",
+        }
+    )
+
+    assert parsed.state is not None
+    assert parsed.state.web_search_enabled is False
 
 
 def test_public_start_registers_bot_commands() -> None:

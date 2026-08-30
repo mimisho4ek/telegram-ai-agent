@@ -843,7 +843,12 @@ async def send_streaming_response(
     try:
         if used_tmux:
             assert tmux_manager is not None
-            response = await tmux_manager.send_stream(channel_key, prompt, on_event)
+            response = await tmux_manager.send_stream(
+                channel_key,
+                prompt,
+                on_event,
+                session_manager=session_manager,
+            )
             # Sync session_id back so reply-to-resume works
             new_sid = tmux_manager.get_session_id(channel_key)
             if new_sid:

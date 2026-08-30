@@ -49,6 +49,9 @@ class TmuxSessionState:
     model: str | None = None
     transcript_path: str | None = None
     base_mcp_config: str | None = None
+    # Durable only while a one-shot research TUI is alive. restore_all uses
+    # this marker to restart it with search disabled after a bot crash.
+    web_search_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,7 @@ def _normalize_state_dict(data: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("model", None)
     normalized.setdefault("transcript_path", None)
     normalized.setdefault("base_mcp_config", normalized.get("mcp_config"))
+    normalized.setdefault("web_search_enabled", False)
     return normalized
 
 

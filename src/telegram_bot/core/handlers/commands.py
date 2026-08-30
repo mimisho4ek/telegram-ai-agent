@@ -35,6 +35,7 @@ from telegram_bot.core.services.codex_update import CodexUpdateResult, CodexUpda
 from telegram_bot.core.services.message_queue import MessageQueue
 from telegram_bot.core.services.picker_store import PickerState, PickerStore
 from telegram_bot.core.services.providers import engine_display_name
+from telegram_bot.core.services.research_grants import ResearchGrantStore
 from telegram_bot.core.services.resume_listing import (
     SessionEntry,
     _same_cwd,
@@ -354,6 +355,66 @@ async def handle_mcpstatus(message: Message, tmux_manager: TmuxManager) -> None:
     key = channel_key(message)
     status = html.escape(tmux_manager.mcp_status_text(key))
     await message.answer(f"<pre>{status}</pre>", parse_mode="HTML")
+
+
+@router.message(Command("research"))
+async def handle_research(
+    message: Message,
+    tmux_manager: TmuxManager,
+    session_manager: SessionManager,
+    message_queue: MessageQueue,
+    research_grants: ResearchGrantStore,
+) -> None:
+    """Authorize live Codex web search for exactly the next task."""
+    key = channel_key(message)
+    arg = (message.text or "").split(maxsplit=1)
+    action = arg[1].strip().lower() if len(arg) > 1 else "next"
+
+    if action == "status":
+        if tmux_manager.is_research_enabled(key):
+            await message.answer(t("ui.research_status_active"))
+        elif research_grants.is_pending(key):
+            await message.answer(t("ui.research_status_pending"))
+        else:
+            await message.answer(t("ui.research_status_off"))
+        return
+
+    if action == "off":
+        if tmux_manager.is_processing(key) or message_queue.is_busy(key):
+            await message.answer(t("ui.exec_mode_busy"))
+            return
+        research_grants.clear(key)
+        await tmux_manager.disable_research(key, session_manager)
+        await message.answer(t("ui.research_disabled"))
+        return
+
+    if action not in {"next", "on"}:
+        await message.answer(t("ui.research_usage"))
+        return
+
+    provider, _model = tmux_manager.get_provider_model(key)
+    if provider is None:
+        provider = session_manager._get_session(key).engine
+    if provider != "codex":
+        await message.answer(t("ui.research_codex_only"))
+        return
+    if tmux_manager.is_processing(key) or message_queue.is_busy(key):
+        await message.answer(t("ui.exec_mode_busy"))
+        return
+
+    if tmux_manager.is_active(key):
+        try:
+            enabled = await tmux_manager.enable_research(key, session_manager)
+        except RuntimeError:
+            logger.warning("research enable failed for %s", key, exc_info=True)
+            await message.answer(t("ui.research_failed"))
+            return
+        if not enabled:
+            await message.answer(t("ui.research_failed"))
+            return
+    else:
+        research_grants.arm(key)
+    await message.answer(t("ui.research_armed"))
 
 
 @router.message(Command("recycle"))

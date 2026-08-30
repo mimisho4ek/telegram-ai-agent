@@ -52,6 +52,17 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.tmux_not_active": "No active tmux session in this topic",
         "ui.recycle_done": "♻️ Runtime restarted",
         "ui.recycle_failed": "❌ Couldn't restart the runtime. Try again in a moment.",
+        "ui.research_armed": (
+            "🌐 Live Codex web search is allowed for the next task only. "
+            "The permission will be removed automatically afterward."
+        ),
+        "ui.research_disabled": "🔒 Codex web search is disabled.",
+        "ui.research_status_active": "🌐 Web search is active for the task in progress.",
+        "ui.research_status_pending": "🌐 Web search is authorized for the next task.",
+        "ui.research_status_off": "🔒 Web search is disabled.",
+        "ui.research_codex_only": "⚠️ /research is available only when Codex is selected.",
+        "ui.research_failed": "❌ Couldn't enable one-shot web search. Try again.",
+        "ui.research_usage": "Use /research, /research status, or /research off.",
         "ui.engine_starting": (
             "🔄 {engine} is starting up — please wait a few seconds before sending."
         ),
@@ -324,6 +335,17 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.recycle_failed": (
             "❌ Не удалось перезапустить runtime. Попробуй ещё раз через пару секунд."
         ),
+        "ui.research_armed": (
+            "🌐 Живой веб-поиск Codex разрешён только для следующей задачи. "
+            "После ответа разрешение снимется автоматически."
+        ),
+        "ui.research_disabled": "🔒 Веб-поиск Codex выключен.",
+        "ui.research_status_active": "🌐 Веб-поиск активен для выполняемой задачи.",
+        "ui.research_status_pending": "🌐 Веб-поиск разрешён для следующей задачи.",
+        "ui.research_status_off": "🔒 Веб-поиск выключен.",
+        "ui.research_codex_only": "⚠️ /research доступна только при выбранном Codex.",
+        "ui.research_failed": "❌ Не удалось включить одноразовый веб-поиск. Повтори.",
+        "ui.research_usage": "Используй /research, /research status или /research off.",
         "ui.engine_starting": (
             "🔄 {engine} запускается — подожди несколько секунд перед отправкой."
         ),
