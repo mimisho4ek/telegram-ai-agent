@@ -3,12 +3,17 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
+
+from aiogram.enums import ChatType
+from aiogram.types import Chat, Message, User
 
 from telegram_bot.core.config import Settings
 from telegram_bot.core.env_file import read_exact_env_file
 from telegram_bot.core.handlers import commands
+from telegram_bot.core.handlers.forum_topic import ExistingTopicRegistrationMiddleware
 from telegram_bot.core.handlers.tail import handle_tail_command
 from telegram_bot.core.keyboards import research_approval_keyboard
 from telegram_bot.core.services import cc_modes
@@ -110,6 +115,54 @@ def test_public_settings_default_cwd_is_generic(monkeypatch) -> None:
     assert settings.project_root == "."
     assert settings.default_cwd == "."
     assert settings.topic_config_path == "./topic_config.json"
+
+
+async def test_existing_topic_is_registered_from_first_message(tmp_path: Path) -> None:
+    config_path = tmp_path / "topic_config.json"
+    settings = Settings(
+        _env_file=None,
+        telegram_bot_token="test-token",
+        project_root=str(tmp_path),
+        topic_config_path="topic_config.json",
+    )
+    message = Message(
+        message_id=1,
+        date=datetime.now(UTC),
+        chat=Chat(id=-100123, type=ChatType.SUPERGROUP, is_forum=True),
+        from_user=User(id=123, is_bot=False, first_name="Operator"),
+        message_thread_id=321,
+        is_topic_message=True,
+        text="hello",
+    )
+    handled: list[int] = []
+
+    async def handler(event, _data):
+        handled.append(event.message_id)
+        return "handled"
+
+    result = await ExistingTopicRegistrationMiddleware()(handler, message, {"settings": settings})
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert result == "handled"
+    assert handled == [1]
+    assert config["topics"]["321"] == {
+        "name": "Topic 321",
+        "type": "project",
+        "mode": "free",
+        "cwd": None,
+        "mcp_config": None,
+    }
+
+    config["topics"]["321"]["name"] = "Configured project"
+    config["topics"]["321"]["cwd"] = "/srv/projects/configured"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    await ExistingTopicRegistrationMiddleware()(handler, message, {"settings": settings})
+    unchanged = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert unchanged["topics"]["321"]["name"] == "Configured project"
+    assert unchanged["topics"]["321"]["cwd"] == "/srv/projects/configured"
+    assert handled == [1, 1]
 
 
 def test_public_dotenv_values_are_not_interpolated(tmp_path: Path, monkeypatch) -> None:

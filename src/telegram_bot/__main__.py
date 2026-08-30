@@ -17,6 +17,7 @@ from aiogram.types import Message
 from telegram_bot.core.config import get_settings
 from telegram_bot.core.handlers.cancel import router as cancel_router
 from telegram_bot.core.handlers.commands import router as commands_router
+from telegram_bot.core.handlers.forum_topic import ExistingTopicRegistrationMiddleware
 from telegram_bot.core.handlers.forum_topic import router as forum_topic_router
 from telegram_bot.core.handlers.forward import ForwardBatcher
 from telegram_bot.core.handlers.forward import router as forward_router
@@ -300,6 +301,8 @@ async def _start() -> None:
     dp = Dispatcher()
     auth = AuthMiddleware(allowed_user_ids=settings.allowed_user_ids)
     dp.message.outer_middleware(auth)
+    # Keep this after auth: only an allowed user's message may mutate topic config.
+    dp.message.outer_middleware(ExistingTopicRegistrationMiddleware())
     dp.callback_query.outer_middleware(auth)
     dp.message.filter(F.chat.type.in_({ChatType.PRIVATE, ChatType.SUPERGROUP}))
 

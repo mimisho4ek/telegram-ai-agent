@@ -226,13 +226,17 @@ replaceable `task` example. Your own installation can add any prompt modes you
 need.
 
 When a new forum topic appears, the running bot registers it in
-`topic_config.json` with default settings. It can receive messages immediately,
+`topic_config.json` with default settings. If the topic predates the running
+bot, send an ordinary message from an allowed user and the bot registers its
+`message_thread_id` on that first message. It can receive messages immediately,
 but it will use defaults until you configure it.
 
 The public `topic_config.json` keys topics by Telegram `message_thread_id`, so
 the simplest and recommended setup is one forum group per bot config. To find a
-topic ID, start the bot, create or rename a topic, send a message there, then
-open the generated `topic_config.json` and edit the new entry.
+topic ID, start the bot, send a message there, then open the generated
+`topic_config.json` and edit the new entry. An old topic without an available
+creation event gets a temporary `Topic <message_thread_id>` name that you can
+replace manually.
 
 ## Topic Configuration
 

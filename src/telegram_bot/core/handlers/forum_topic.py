@@ -17,13 +17,14 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from aiogram import Bot, F, Router
+from aiogram import BaseMiddleware, Bot, F, Router
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message
+from aiogram.types import Message, TelegramObject
 
 from telegram_bot.core.config import Settings
 from telegram_bot.core.keyboards import topic_keyboard
@@ -80,6 +81,59 @@ def _save_config(path: Path, data: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+async def _register_topic(*, thread_id: int, name: str, settings: Settings) -> bool:
+    """Register a topic if missing and return whether a new entry was written."""
+    config_path = _resolve_config_path(settings)
+    async with _config_lock:
+        try:
+            config = _load_config(config_path)
+        except json.JSONDecodeError:
+            return False
+        key = str(thread_id)
+        if key in config["topics"]:
+            return False
+        config["topics"][key] = _new_entry(name)
+        _save_config(config_path, config)
+    return True
+
+
+class ExistingTopicRegistrationMiddleware(BaseMiddleware):
+    """Lazily register pre-existing topics on their first authorized message.
+
+    Telegram does not replay ``forum_topic_created`` after the bot starts. This
+    fallback lets operators wire topics that predate the bot by simply sending
+    a message in each one. Ordinary topic messages do not include the topic
+    title, so the rename event can replace the placeholder later.
+    """
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        if (
+            isinstance(event, Message)
+            and event.is_topic_message
+            and event.message_thread_id is not None
+            and event.forum_topic_created is None
+            and event.forum_topic_edited is None
+        ):
+            settings = data.get("settings")
+            if isinstance(settings, Settings):
+                thread_id = event.message_thread_id
+                if await _register_topic(
+                    thread_id=thread_id,
+                    name=f"Topic {thread_id}",
+                    settings=settings,
+                ):
+                    logger.info(
+                        "Auto-registered existing topic thread_id=%d from first message",
+                        thread_id,
+                    )
+        return await handler(event, data)
+
+
 @router.message(F.forum_topic_created)
 async def on_topic_created(message: Message, settings: Settings, bot: Bot) -> None:
     """Add a new topic to topic_config.json with default mode/cwd, then post a welcome."""
@@ -88,26 +142,11 @@ async def on_topic_created(message: Message, settings: Settings, bot: Bot) -> No
     name = message.forum_topic_created.name
     thread_id = message.message_thread_id
     chat_id = message.chat.id
-    config_path = _resolve_config_path(settings)
-
-    newly_registered = False
-    async with _config_lock:
-        try:
-            config = _load_config(config_path)
-        except json.JSONDecodeError:
-            return
-        key = str(thread_id)
-        if key in config["topics"]:
-            # Already registered (e.g. CC pre-registered or restart re-fired event).
-            return
-        config["topics"][key] = _new_entry(name)
-        _save_config(config_path, config)
-        newly_registered = True
-
-    logger.info("Auto-registered topic thread_id=%d name=%r", thread_id, name)
-
+    newly_registered = await _register_topic(thread_id=thread_id, name=name, settings=settings)
     if not newly_registered:
         return
+
+    logger.info("Auto-registered topic thread_id=%d name=%r", thread_id, name)
 
     try:
         await bot.send_message(
