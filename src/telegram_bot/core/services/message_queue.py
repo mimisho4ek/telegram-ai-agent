@@ -28,6 +28,7 @@ class QueueItem:
     source_messages: list[Message]
     target_session_id: str | None = None
     start_new_session: bool = False
+    research_grant: bool = False
 
 
 @dataclass
@@ -259,21 +260,18 @@ class MessageQueue:
                 )
 
                 try:
+                    callback_kwargs: dict[str, bool] = {}
                     if item.start_new_session:
-                        await self._process_callback(
-                            channel_key,
-                            combined_prompt,
-                            item.source_messages,
-                            item.target_session_id,
-                            start_new_session=True,
-                        )
-                    else:
-                        await self._process_callback(
-                            channel_key,
-                            combined_prompt,
-                            item.source_messages,
-                            item.target_session_id,
-                        )
+                        callback_kwargs["start_new_session"] = True
+                    if item.research_grant:
+                        callback_kwargs["research_grant"] = True
+                    await self._process_callback(
+                        channel_key,
+                        combined_prompt,
+                        item.source_messages,
+                        item.target_session_id,
+                        **callback_kwargs,
+                    )
                     queue.error_count = 0
                 except Exception:
                     # Drop semantics: the item was already popped above and is
@@ -300,6 +298,32 @@ class MessageQueue:
                     await self._send_notification(channel_key, t("ui.queue_item_dropped"))
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(queue.wake.wait(), timeout=backoff_sec)
+
+    def enqueue_research_retry(
+        self,
+        channel_key: ChannelKey,
+        *,
+        prompt: str,
+        message_id: int,
+        source_message: Message,
+    ) -> None:
+        """Place an approved retry immediately after the currently running item."""
+        queue = self._get_queue(channel_key)
+        queue.items.appendleft(
+            QueueItem(
+                entries=[(message_id, prompt)],
+                source_messages=[source_message],
+                research_grant=True,
+            )
+        )
+        logger.info(
+            "MSG_TRACE queue_research_retry channel=%s msg=%d prompt_len=%d",
+            channel_key,
+            message_id,
+            len(prompt),
+        )
+        if not queue.lock.locked():
+            self._start_processing(channel_key)
 
     async def clear(self, channel_key: ChannelKey) -> None:
         """Clear the queue for a channel: wait for active processing, then discard pending items."""

@@ -115,6 +115,24 @@ def engine_keyboard(current_engine: str | None = None) -> InlineKeyboardMarkup:
     )
 
 
+def research_approval_keyboard(token: str) -> InlineKeyboardMarkup:
+    """One-shot allow/deny controls for an agent-requested web search."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=t("ui.research_allow_once"),
+                    callback_data=f"research_approval:allow:{token}",
+                ),
+                InlineKeyboardButton(
+                    text=t("ui.research_deny"),
+                    callback_data=f"research_approval:deny:{token}",
+                ),
+            ]
+        ]
+    )
+
+
 def resume_keyboard(
     entries: tuple[SessionEntry, ...] | list[SessionEntry],
     *,

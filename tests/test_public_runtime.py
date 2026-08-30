@@ -10,16 +10,23 @@ from telegram_bot.core.config import Settings
 from telegram_bot.core.env_file import read_exact_env_file
 from telegram_bot.core.handlers import commands
 from telegram_bot.core.handlers.tail import handle_tail_command
+from telegram_bot.core.keyboards import research_approval_keyboard
 from telegram_bot.core.services import cc_modes
 from telegram_bot.core.services.bot_commands import build_bot_commands
 from telegram_bot.core.services.claude import SessionManager
+from telegram_bot.core.services.message_queue import MessageQueue
 from telegram_bot.core.services.providers import (
     CODEX_ADAPTER,
     CodexTranscriptParser,
     agent_process_env,
     choose_available_engine,
 )
-from telegram_bot.core.services.research_grants import ResearchGrantStore
+from telegram_bot.core.services.research_grants import (
+    RESEARCH_PERMISSION_MARKER,
+    ResearchGrantStore,
+    research_request_reason,
+    wrap_with_research_policy,
+)
 from telegram_bot.core.services.rich_sender import detect_rich_send
 from telegram_bot.core.services.tmux_spawn import (
     sanitized_tmux_environment,
@@ -488,6 +495,7 @@ def test_public_command_handlers_are_wired() -> None:
     assert commands.handle_recycle is not None
     assert commands.handle_mcpstatus is not None
     assert commands.handle_research is not None
+    assert commands.on_research_approval is not None
     assert handle_tail_command is not None
 
 
@@ -510,6 +518,16 @@ def test_research_command_is_reserved_for_the_bot() -> None:
     assert route_slash_command("/research status") == "bot"
 
 
+def test_research_approval_keyboard_uses_token_bound_actions() -> None:
+    keyboard = research_approval_keyboard("abc123")
+    callback_data = [button.callback_data for button in keyboard.inline_keyboard[0]]
+
+    assert callback_data == [
+        "research_approval:allow:abc123",
+        "research_approval:deny:abc123",
+    ]
+
+
 def test_research_grant_is_one_shot_and_process_local() -> None:
     grants = ResearchGrantStore()
     key = (123, 456)
@@ -520,6 +538,60 @@ def test_research_grant_is_one_shot_and_process_local() -> None:
     assert grants.consume(key) is True
     assert grants.consume(key) is False
     assert ResearchGrantStore().is_pending(key) is False
+
+
+def test_research_approval_is_token_bound_and_one_shot() -> None:
+    grants = ResearchGrantStore()
+    key = (123, 456)
+    source_message = object()
+    request = grants.request_approval(
+        key,
+        prompt="find current forks",
+        source_message=source_message,
+    )
+
+    assert grants.take_approval(key, "wrong-token") is None
+    assert grants.take_approval(key, request.token) == request
+    assert grants.take_approval(key, request.token) is None
+
+    replacement = grants.request_approval(
+        key,
+        prompt="another task",
+        source_message=source_message,
+    )
+    grants.clear(key)
+    assert grants.take_approval(key, replacement.token) is None
+
+
+def test_approved_research_retry_is_prioritized() -> None:
+    queue = MessageQueue(MagicMock(), MagicMock(), MagicMock())
+    queue._start_processing = MagicMock()  # type: ignore[method-assign]
+    source_message = MagicMock()
+    source_message.message_id = 7
+
+    queue.enqueue_research_retry(
+        (1, 2),
+        prompt="original task",
+        message_id=7,
+        source_message=source_message,
+    )
+
+    item = queue._get_queue((1, 2)).items[0]
+    assert item.research_grant is True
+    assert item.entries == [(7, "original task")]
+    queue._start_processing.assert_called_once_with((1, 2))
+
+
+def test_research_policy_and_marker_parser_are_strict() -> None:
+    wrapped = wrap_with_research_policy("task", web_search_enabled=False)
+
+    assert RESEARCH_PERMISSION_MARKER in wrapped
+    assert wrapped.endswith("task")
+    assert wrap_with_research_policy("task", web_search_enabled=True) == "task"
+    assert research_request_reason(f"{RESEARCH_PERMISSION_MARKER}\nNeed current releases") == (
+        "Need current releases"
+    )
+    assert research_request_reason(f"prefix {RESEARCH_PERMISSION_MARKER}") is None
 
 
 def test_codex_tui_web_search_is_explicit_and_opt_in(tmp_path: Path, monkeypatch) -> None:
@@ -560,14 +632,16 @@ def test_codex_subprocess_consumes_research_grant_once(tmp_path: Path, monkeypat
     session = manager._get_session(key)
     session.engine = "codex"
 
-    disabled = manager._build_exec_command("first", session).argv
+    disabled_command = manager._build_exec_command("first", session)
     grants.arm(key)
-    enabled = manager._build_exec_command("second", session).argv
-    disabled_again = manager._build_exec_command("third", session).argv
+    enabled_command = manager._build_exec_command("second", session)
+    disabled_again_command = manager._build_exec_command("third", session)
 
-    assert 'web_search="disabled"' in disabled
-    assert 'web_search="live"' in enabled
-    assert 'web_search="disabled"' in disabled_again
+    assert 'web_search="disabled"' in disabled_command.argv
+    assert RESEARCH_PERMISSION_MARKER in (disabled_command.stdin_text or "")
+    assert 'web_search="live"' in enabled_command.argv
+    assert RESEARCH_PERMISSION_MARKER not in (enabled_command.stdin_text or "")
+    assert 'web_search="disabled"' in disabled_again_command.argv
 
 
 def test_legacy_tmux_state_defaults_web_search_to_disabled() -> None:

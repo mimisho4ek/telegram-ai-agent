@@ -57,7 +57,10 @@ from telegram_bot.core.services.providers import (
     claude_binary,
     codex_process_env,
 )
-from telegram_bot.core.services.research_grants import ResearchGrantStore
+from telegram_bot.core.services.research_grants import (
+    ResearchGrantStore,
+    wrap_with_research_policy,
+)
 from telegram_bot.core.services.topic_runtime import BotDefaults, resolve_topic_runtime_config
 from telegram_bot.core.types import ChannelKey
 
@@ -501,6 +504,10 @@ class SessionManager:
             "-c",
             f'web_search="{"live" if web_search else "disabled"}"',
         ]
+        effective_prompt = wrap_with_research_policy(
+            prompt,
+            web_search_enabled=web_search,
+        )
 
         if session.session_id:
             argv = [
@@ -539,7 +546,7 @@ class SessionManager:
             argv=argv,
             cwd=cwd,
             stdin_text=self._build_full_prompt(
-                prompt,
+                effective_prompt,
                 session.session_id,
                 session.mode,
                 session.chat_id,

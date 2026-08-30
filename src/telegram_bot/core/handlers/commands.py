@@ -308,8 +308,10 @@ async def handle_clear(
     forward_batcher: ForwardBatcher,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig,
+    research_grants: ResearchGrantStore,
 ) -> None:
     key = channel_key(message)
+    research_grants.clear(key)
     logger.debug("User %s requested clear", message.from_user and message.from_user.id)
     await _reset_channel(
         message, key, session_manager, message_queue, forward_batcher, tmux_manager, topic_config
@@ -322,8 +324,10 @@ async def handle_cancel_command(
     session_manager: SessionManager,
     message_queue: MessageQueue,
     tmux_manager: TmuxManager,
+    research_grants: ResearchGrantStore,
 ) -> None:
     key = channel_key(message)
+    research_grants.clear(key)
     tmux_acted = tmux_manager.is_active(key)
     if tmux_acted:
         await tmux_manager.cancel(key)
@@ -336,9 +340,14 @@ async def handle_cancel_command(
 
 
 @router.message(Command("kill"))
-async def handle_kill(message: Message, tmux_manager: TmuxManager) -> None:
+async def handle_kill(
+    message: Message,
+    tmux_manager: TmuxManager,
+    research_grants: ResearchGrantStore,
+) -> None:
     """Kill the tmux session in the current topic."""
     key = channel_key(message)
+    research_grants.clear(key)
     if not tmux_manager.is_active(key):
         await message.answer(t("ui.tmux_not_active"))
         return
@@ -415,6 +424,50 @@ async def handle_research(
     else:
         research_grants.arm(key)
     await message.answer(t("ui.research_armed"))
+
+
+@router.callback_query(F.data.startswith("research_approval:"))
+async def on_research_approval(
+    callback: CallbackQuery,
+    message_queue: MessageQueue,
+    research_grants: ResearchGrantStore,
+) -> None:
+    """Approve or deny an agent-requested one-shot research retry."""
+    key = _callback_key(callback)
+    if key is None or callback.data is None:
+        await callback.answer(t("ui.research_approval_stale"), show_alert=True)
+        return
+    parts = callback.data.split(":", maxsplit=2)
+    if len(parts) != 3 or parts[1] not in {"allow", "deny"}:
+        await callback.answer(t("ui.research_approval_stale"), show_alert=True)
+        return
+    action, token = parts[1], parts[2]
+    request = research_grants.take_approval(key, token)
+    if request is None:
+        await callback.answer(t("ui.research_approval_stale"), show_alert=True)
+        return
+
+    if action == "deny":
+        if callback.message is not None and not isinstance(callback.message, InaccessibleMessage):
+            with contextlib.suppress(TelegramBadRequest):
+                await callback.message.edit_text(t("ui.research_denied"), reply_markup=None)
+        await callback.answer()
+        return
+
+    source_message = request.source_message
+    if not isinstance(source_message, Message):
+        await callback.answer(t("ui.research_approval_stale"), show_alert=True)
+        return
+    message_queue.enqueue_research_retry(
+        key,
+        prompt=request.prompt,
+        message_id=source_message.message_id,
+        source_message=source_message,
+    )
+    if callback.message is not None and not isinstance(callback.message, InaccessibleMessage):
+        with contextlib.suppress(TelegramBadRequest):
+            await callback.message.edit_text(t("ui.research_approved"), reply_markup=None)
+    await callback.answer(t("ui.research_approved_toast"))
 
 
 @router.message(Command("recycle"))
@@ -883,6 +936,7 @@ async def on_engine_click(
     tmux_manager: TmuxManager,
     message_queue: MessageQueue,
     session_manager: SessionManager,
+    research_grants: ResearchGrantStore,
 ) -> None:
     """Apply provider engine changes for the picker topic."""
     if callback.data is None or callback.message is None:
@@ -913,6 +967,7 @@ async def on_engine_click(
         await callback.answer(t("ui.engine_already"))
         return
 
+    research_grants.clear(key)
     if current.models:
         ok = await topic_config.update_engine(thread_id, new_engine)
     else:

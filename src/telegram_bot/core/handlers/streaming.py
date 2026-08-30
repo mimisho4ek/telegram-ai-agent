@@ -14,11 +14,15 @@ from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import Message
 
-from telegram_bot.core.keyboards import topic_keyboard
+from telegram_bot.core.keyboards import research_approval_keyboard, topic_keyboard
 from telegram_bot.core.messages import t
 from telegram_bot.core.services.claude import SessionManager, StreamEvent
 from telegram_bot.core.services.live_buffer import LiveStatusBuffer
 from telegram_bot.core.services.providers import choose_available_engine, engine_display_name
+from telegram_bot.core.services.research_grants import (
+    ResearchGrantStore,
+    research_request_reason,
+)
 from telegram_bot.core.services.rich_content import normalize_telegram_text_content
 from telegram_bot.core.services.rich_sender import send_rich_final_answer
 from telegram_bot.core.services.telegram_utils import (
@@ -621,6 +625,7 @@ async def send_streaming_response(
     git_sync: Any | None = None,
     tmux_manager: TmuxManager | None = None,
     topic_config: TopicConfig | None = None,
+    research_grants: ResearchGrantStore | None = None,
 ) -> None:
     """Send prompt to CC with streaming and deliver response to user.
 
@@ -719,6 +724,24 @@ async def send_streaming_response(
         live_buffer=live_buffer,
         sent_message_ids=sent_message_ids,
     )
+
+    async def _offer_research_approval(text: str) -> bool:
+        if research_grants is None:
+            return False
+        reason = research_request_reason(text)
+        if reason is None:
+            return False
+        reason = reason[:1200]
+        request = research_grants.request_approval(
+            channel_key,
+            prompt=prompt,
+            source_message=message,
+        )
+        await message.answer(
+            t("ui.research_permission_requested", reason=reason),
+            reply_markup=research_approval_keyboard(request.token),
+        )
+        return True
 
     async def _ensure_tmux_live_buffer(turn_id: str | None) -> LiveStatusBuffer | None:
         if not ctx.used_tmux or ctx.tmux_manager is None:
@@ -820,6 +843,8 @@ async def send_streaming_response(
             await _close_turn_progress(event.turn_id)
             # A prior progress-send failure must not suppress the final.
             ctx.send_failed = False
+            if await _offer_research_approval(event.content):
+                return True
             return await _handle_result_message_event(ctx, event)
         return None
 
@@ -889,6 +914,9 @@ async def send_streaming_response(
     # so no post-stream recording is needed here.
     final_text = response
     if not final_text:
+        return
+
+    if await _offer_research_approval(final_text):
         return
 
     await _send_final_response(ctx, final_text)

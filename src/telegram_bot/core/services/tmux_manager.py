@@ -62,7 +62,10 @@ from telegram_bot.core.services.providers import (
     CodexTranscriptSnapshot,
     agent_env_prefix,
 )
-from telegram_bot.core.services.research_grants import ResearchGrantStore
+from telegram_bot.core.services.research_grants import (
+    ResearchGrantStore,
+    wrap_with_research_policy,
+)
 from telegram_bot.core.services.tail_runner import TailRunner
 from telegram_bot.core.services.tmux_modal_watchdog import (
     ModalWatchdog,
@@ -2478,7 +2481,15 @@ class TmuxManager:
                     codex_snapshot = CODEX_ADAPTER.capture_tui_transcript_snapshot()
 
                 self._cancel_events[channel_key] = cancel_event
-                delivered = await self._safe_send_and_enter(channel_key, state, prompt)
+                effective_prompt = wrap_with_research_policy(
+                    prompt,
+                    web_search_enabled=(state.provider != "codex" or state.web_search_enabled),
+                )
+                delivered = await self._safe_send_and_enter(
+                    channel_key,
+                    state,
+                    effective_prompt,
+                )
                 if not delivered:
                     # _safe_send_and_enter posted an alert; do not start tail.
                     return ""

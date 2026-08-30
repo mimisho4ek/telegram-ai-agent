@@ -401,7 +401,10 @@ still exists as a legacy alias, but `/clear` is the command shown in the menu.
   redacted result.
 - `/research`: allow Codex live web search for the next task only. Use
   `/research status` to inspect the permission or `/research off` to revoke it.
-  Search is explicitly disabled for every other Codex launch.
+  Search is explicitly disabled for every other Codex launch. When Codex
+  determines that a task needs current external information, the bot can also
+  show **Allow once** / **Deny** buttons; approval automatically retries the
+  original task and expires after that task.
 - `/stream`: forum topics only; choose `verbose`, `live`, or `minimal`.
 - `/resume`: forum topics only; resume a saved tmux session for the current
   topic working directory.

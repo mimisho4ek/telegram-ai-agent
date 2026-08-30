@@ -139,9 +139,38 @@ async def process_queue_item(
     bot: Bot,
     session_manager: SessionManager,
     tmux_manager: TmuxManager,
+    research_grants: ResearchGrantStore,
+    research_grant: bool = False,
+    start_new_session: bool = False,
 ) -> None:
     """Send a queued prompt to CC; on session change, notify the user."""
     old_session_id = session_manager.get_current_session_id(channel_key)
+
+    if research_grant:
+        if tmux_manager.is_active(channel_key):
+            try:
+                enabled = await tmux_manager.enable_research(channel_key, session_manager)
+            except RuntimeError:
+                logger.warning(
+                    "Approved research restart failed for %s",
+                    channel_key,
+                    exc_info=True,
+                )
+                await bot.send_message(
+                    channel_key[0],
+                    t("ui.research_failed"),
+                    message_thread_id=channel_key[1],
+                )
+                return
+            if not enabled:
+                await bot.send_message(
+                    channel_key[0],
+                    t("ui.research_failed"),
+                    message_thread_id=channel_key[1],
+                )
+                return
+        else:
+            research_grants.arm(channel_key)
 
     # After kill/reset, ignore reply-to-resume on the next message.
     if session_manager.consume_fresh_start(channel_key):
@@ -171,9 +200,20 @@ async def process_queue_item(
     reply_message = source_messages[-1] if source_messages else None
     if reply_message is None:
         return
-    await send_streaming_response(
-        reply_message, session_manager, channel_key, prompt, tmux_manager=tmux_manager
-    )
+    try:
+        await send_streaming_response(
+            reply_message,
+            session_manager,
+            channel_key,
+            prompt,
+            tmux_manager=tmux_manager,
+            research_grants=research_grants,
+        )
+    finally:
+        if research_grant:
+            # If Codex never launched (for example it disappeared before an
+            # automatic retry), do not let this approval leak to a later task.
+            research_grants.consume(channel_key)
 
 
 async def _start() -> None:
@@ -227,6 +267,9 @@ async def _start() -> None:
         prompt: str,
         source_messages: list[Message],
         target_session_id: str | None,
+        *,
+        research_grant: bool = False,
+        start_new_session: bool = False,
     ) -> None:
         await process_queue_item(
             channel_key,
@@ -236,6 +279,9 @@ async def _start() -> None:
             bot=bot,
             session_manager=session_manager,
             tmux_manager=tmux_manager,
+            research_grants=research_grants,
+            research_grant=research_grant,
+            start_new_session=start_new_session,
         )
 
     message_queue = MessageQueue(bot, session_manager, _process_queue_item)

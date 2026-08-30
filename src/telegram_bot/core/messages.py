@@ -63,6 +63,16 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.research_codex_only": "⚠️ /research is available only when Codex is selected.",
         "ui.research_failed": "❌ Couldn't enable one-shot web search. Try again.",
         "ui.research_usage": "Use /research, /research status, or /research off.",
+        "ui.research_permission_requested": (
+            "🌐 Codex needs internet access to continue:\n\n{reason}\n\n"
+            "Allow live web search for this task only?"
+        ),
+        "ui.research_allow_once": "🌐 Allow once",
+        "ui.research_deny": "🔒 Deny",
+        "ui.research_approved": "🌐 Approved once. Restarting the original task…",
+        "ui.research_approved_toast": "Research approved",
+        "ui.research_denied": "🔒 Web research was not authorized.",
+        "ui.research_approval_stale": "This research request is no longer active.",
         "ui.engine_starting": (
             "🔄 {engine} is starting up — please wait a few seconds before sending."
         ),
@@ -346,6 +356,16 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.research_codex_only": "⚠️ /research доступна только при выбранном Codex.",
         "ui.research_failed": "❌ Не удалось включить одноразовый веб-поиск. Повтори.",
         "ui.research_usage": "Используй /research, /research status или /research off.",
+        "ui.research_permission_requested": (
+            "🌐 Для продолжения Codex нужен доступ в интернет:\n\n{reason}\n\n"
+            "Разрешить живой веб-поиск только для этой задачи?"
+        ),
+        "ui.research_allow_once": "🌐 Разрешить один раз",
+        "ui.research_deny": "🔒 Отказать",
+        "ui.research_approved": "🌐 Разрешено один раз. Перезапускаю исходную задачу…",
+        "ui.research_approved_toast": "Поиск разрешён",
+        "ui.research_denied": "🔒 Веб-ресерч не разрешён.",
+        "ui.research_approval_stale": "Этот запрос на ресерч уже неактуален.",
         "ui.engine_starting": (
             "🔄 {engine} запускается — подожди несколько секунд перед отправкой."
         ),
