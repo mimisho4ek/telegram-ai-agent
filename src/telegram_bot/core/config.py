@@ -75,6 +75,9 @@ class Settings(BaseSettings):
     codex_update_timeout_sec: float = 180
     codex_update_cooldown_sec: float = 86400
     codex_auto_update_enabled: bool = True
+    # Backwards-compatible default: keep the historical unrestricted Codex
+    # runtime unless the operator explicitly opts into sandboxed execution.
+    codex_full_access: bool = True
 
     @classmethod
     def settings_customise_sources(

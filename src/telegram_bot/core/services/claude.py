@@ -48,6 +48,7 @@ from telegram_bot.core.services.codex_mcp import (
     build_codex_mcp_config_args,
     discover_codex_mcp_server_names,
 )
+from telegram_bot.core.services.full_access_grants import FullAccessGrantStore
 from telegram_bot.core.services.process_cleanup import tagged_processes, terminate_processes
 from telegram_bot.core.services.providers import (
     CODEX_ADAPTER,
@@ -55,6 +56,7 @@ from telegram_bot.core.services.providers import (
     agent_process_env,
     choose_available_engine,
     claude_binary,
+    codex_permission_args,
     codex_process_env,
 )
 from telegram_bot.core.services.research_grants import (
@@ -167,10 +169,12 @@ class SessionManager:
         settings: Settings,
         topic_config: TopicConfig | None = None,
         research_grants: ResearchGrantStore | None = None,
+        full_access_grants: FullAccessGrantStore | None = None,
     ) -> None:
         self._settings = settings
         self._topic_config = topic_config
         self._research_grants = research_grants
+        self._full_access_grants = full_access_grants
         self._sessions: dict[ChannelKey, SessionData] = {}
         self._cleanup_task: asyncio.Task[None] | None = None
         self._msg_sessions: collections.OrderedDict[int, object] = collections.OrderedDict()
@@ -504,6 +508,11 @@ class SessionManager:
             "-c",
             f'web_search="{"live" if web_search else "disabled"}"',
         ]
+        full_access = self._settings.codex_full_access or bool(
+            self._full_access_grants
+            and self._full_access_grants.consume((session.chat_id, session.thread_id))
+        )
+        permission_args = codex_permission_args(full_access=full_access)
         effective_prompt = wrap_with_research_policy(
             prompt,
             web_search_enabled=web_search,
@@ -516,10 +525,10 @@ class SessionManager:
                 "resume",
                 *mcp_args,
                 *web_search_args,
+                *permission_args,
                 session.session_id,
                 "--json",
                 "--skip-git-repo-check",
-                "--dangerously-bypass-approvals-and-sandbox",
                 "-o",
                 str(output_path),
                 "-",
@@ -530,11 +539,11 @@ class SessionManager:
                 "exec",
                 *mcp_args,
                 *web_search_args,
+                *permission_args,
                 "--json",
                 "--cd",
                 cwd,
                 "--skip-git-repo-check",
-                "--dangerously-bypass-approvals-and-sandbox",
                 "-o",
                 str(output_path),
                 "-",

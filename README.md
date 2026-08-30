@@ -171,6 +171,7 @@ CC_INACTIVITY_KILL_SEC=1800
 CODEX_AUTO_UPDATE_ENABLED=true
 CODEX_UPDATE_TIMEOUT_SEC=180
 CODEX_UPDATE_COOLDOWN_SEC=86400
+CODEX_FULL_ACCESS=true
 ```
 
 Notes:
@@ -187,6 +188,10 @@ Notes:
 - `DEEPGRAM_API_KEY`: leave empty if you do not need voice messages.
 - `CODEX_AUTO_UPDATE_ENABLED`: enables automatic and manual Codex updates.
   Timeout bounds every update; cooldown applies only to automatic updates.
+- `CODEX_FULL_ACCESS`: unrestricted Codex filesystem/shell access. Defaults to
+  `true` for backwards compatibility. Set it to `false` to use a workspace-write
+  sandbox with command networking disabled; `/fullaccess` can then elevate only
+  the next task.
 
 Run in the foreground:
 
@@ -405,6 +410,10 @@ still exists as a legacy alias, but `/clear` is the command shown in the menu.
   determines that a task needs current external information, the bot can also
   show **Allow once** / **Deny** buttons; approval automatically retries the
   original task and expires after that task.
+- `/fullaccess`: when `CODEX_FULL_ACCESS=false`, allow unrestricted Codex
+  filesystem and shell access for the next task only. `/fullaccess status`
+  shows the effective mode and `/fullaccess off` revokes a pending grant.
+  This permission is independent from `/research`.
 - `/stream`: forum topics only; choose `verbose`, `live`, or `minimal`.
 - `/resume`: forum topics only; resume a saved tmux session for the current
   topic working directory.

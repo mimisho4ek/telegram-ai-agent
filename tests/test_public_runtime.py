@@ -14,12 +14,14 @@ from telegram_bot.core.keyboards import research_approval_keyboard
 from telegram_bot.core.services import cc_modes
 from telegram_bot.core.services.bot_commands import build_bot_commands
 from telegram_bot.core.services.claude import SessionManager
+from telegram_bot.core.services.full_access_grants import FullAccessGrantStore
 from telegram_bot.core.services.message_queue import MessageQueue
 from telegram_bot.core.services.providers import (
     CODEX_ADAPTER,
     CodexTranscriptParser,
     agent_process_env,
     choose_available_engine,
+    codex_permission_args,
 )
 from telegram_bot.core.services.research_grants import (
     RESEARCH_PERMISSION_MARKER,
@@ -496,6 +498,7 @@ def test_public_command_handlers_are_wired() -> None:
     assert commands.handle_mcpstatus is not None
     assert commands.handle_research is not None
     assert commands.on_research_approval is not None
+    assert commands.handle_full_access is not None
     assert handle_tail_command is not None
 
 
@@ -505,6 +508,7 @@ def test_public_bot_command_menu_is_public_only() -> None:
     assert "clear" in command_names
     assert "codex_update" in command_names
     assert "research" in command_names
+    assert "fullaccess" in command_names
     assert "recycle" in command_names
     assert "mcpstatus" in command_names
     assert "tui" in command_names
@@ -516,6 +520,7 @@ def test_public_bot_command_menu_is_public_only() -> None:
 def test_research_command_is_reserved_for_the_bot() -> None:
     assert route_slash_command("/research") == "bot"
     assert route_slash_command("/research status") == "bot"
+    assert route_slash_command("/fullaccess") == "bot"
 
 
 def test_research_approval_keyboard_uses_token_bound_actions() -> None:
@@ -538,6 +543,16 @@ def test_research_grant_is_one_shot_and_process_local() -> None:
     assert grants.consume(key) is True
     assert grants.consume(key) is False
     assert ResearchGrantStore().is_pending(key) is False
+
+
+def test_full_access_grant_is_one_shot() -> None:
+    grants = FullAccessGrantStore()
+    key = (123, 456)
+
+    grants.arm(key)
+    assert grants.is_pending(key) is True
+    assert grants.consume(key) is True
+    assert grants.consume(key) is False
 
 
 def test_research_approval_is_token_bound_and_one_shot() -> None:
@@ -613,6 +628,21 @@ def test_codex_tui_web_search_is_explicit_and_opt_in(tmp_path: Path, monkeypatch
     )
     assert 'web_search="live"' in resumed
 
+    sandboxed = CODEX_ADAPTER.build_tui_start(cwd=str(tmp_path), full_access=False)
+    assert 'sandbox_mode="workspace-write"' in sandboxed
+    assert "sandbox_workspace_write.network_access=false" in sandboxed
+    assert "--dangerously-bypass-approvals-and-sandbox" not in sandboxed
+
+
+def test_codex_permission_args_default_to_full_and_support_sandbox() -> None:
+    assert codex_permission_args(full_access=True) == ["--dangerously-bypass-approvals-and-sandbox"]
+    restricted = codex_permission_args(full_access=False)
+
+    assert 'sandbox_mode="workspace-write"' in restricted
+    assert 'approval_policy="never"' in restricted
+    assert "sandbox_workspace_write.network_access=false" in restricted
+    assert "--dangerously-bypass-approvals-and-sandbox" not in restricted
+
 
 def test_codex_subprocess_consumes_research_grant_once(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
@@ -644,6 +674,38 @@ def test_codex_subprocess_consumes_research_grant_once(tmp_path: Path, monkeypat
     assert 'web_search="disabled"' in disabled_again_command.argv
 
 
+def test_codex_subprocess_full_access_defaults_true_and_can_be_one_shot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "telegram_bot.core.services.claude.discover_codex_mcp_server_names",
+        lambda *_args, **_kwargs: set(),
+    )
+    grants = FullAccessGrantStore()
+    settings = Settings(
+        _env_file=None,
+        telegram_bot_token="test-token",
+        project_root=str(tmp_path),
+        default_cwd=".",
+        file_cache_dir="./data",
+        codex_full_access=False,
+    )
+    manager = SessionManager(settings, full_access_grants=grants)
+    key = (321, None)
+    session = manager._get_session(key)
+    session.engine = "codex"
+
+    restricted = manager._build_exec_command("first", session).argv
+    grants.arm(key)
+    elevated = manager._build_exec_command("second", session).argv
+    restricted_again = manager._build_exec_command("third", session).argv
+
+    assert "--dangerously-bypass-approvals-and-sandbox" not in restricted
+    assert 'sandbox_mode="workspace-write"' in restricted
+    assert "--dangerously-bypass-approvals-and-sandbox" in elevated
+    assert "--dangerously-bypass-approvals-and-sandbox" not in restricted_again
+
+
 def test_legacy_tmux_state_defaults_web_search_to_disabled() -> None:
     parsed = parse_state_entry(
         {
@@ -661,6 +723,21 @@ def test_legacy_tmux_state_defaults_web_search_to_disabled() -> None:
 
     assert parsed.state is not None
     assert parsed.state.web_search_enabled is False
+    assert parsed.state.full_access_enabled is True
+
+
+def test_codex_full_access_setting_defaults_true() -> None:
+    settings = Settings(_env_file=None, telegram_bot_token="test-token")
+
+    assert settings.codex_full_access is True
+
+
+def test_codex_full_access_setting_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_FULL_ACCESS", "false")
+
+    settings = Settings(_env_file=None, telegram_bot_token="test-token")
+
+    assert settings.codex_full_access is False
 
 
 def test_public_start_registers_bot_commands() -> None:

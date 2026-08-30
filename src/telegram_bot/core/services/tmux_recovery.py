@@ -144,6 +144,7 @@ def build_resume_startup_cmd(
     model: str | None,
     session_manager: object,
     web_search: bool = False,
+    full_access: bool = True,
 ) -> list[str]:
     """Build provider-specific TUI resume argv."""
     if provider == "codex":
@@ -153,6 +154,7 @@ def build_resume_startup_cmd(
             model=model,
             mcp_config=mcp_config,
             web_search=web_search,
+            full_access=full_access,
         )
     return cast(
         list[str],
@@ -222,19 +224,26 @@ def restore_all(
             is_claude_tui = rv in {"tui-v1", "claude-tui-v1"} and state.provider == "claude"
             is_codex_tui = rv == "codex-tui-v1" and state.provider == "codex"
             is_supported_tui = is_claude_tui or is_codex_tui
+            full_access_default = bool(getattr(manager, "_codex_full_access_default", True))
 
-            if alive and is_codex_tui and state.web_search_enabled:
-                logger.warning(
-                    "Restarting one-shot research session %s with web search disabled",
-                    state.session_name,
-                )
-                _tm.subprocess.run(  # type: ignore[attr-defined]
-                    ["tmux", "kill-session", "-t", f"={state.session_name}"],
-                    capture_output=True,
-                    check=False,
-                    env=sanitized_tmux_environment(run=_tm.subprocess.run),  # type: ignore[attr-defined]
-                )
+            if is_codex_tui and (
+                state.web_search_enabled or state.full_access_enabled != full_access_default
+            ):
+                if alive:
+                    logger.warning(
+                        "Restarting Codex session %s with one-shot permissions reset",
+                        state.session_name,
+                    )
+                    _tm.subprocess.run(  # type: ignore[attr-defined]
+                        ["tmux", "kill-session", "-t", f"={state.session_name}"],
+                        capture_output=True,
+                        check=False,
+                        env=sanitized_tmux_environment(
+                            run=_tm.subprocess.run  # type: ignore[attr-defined]
+                        ),
+                    )
                 state.web_search_enabled = False
+                state.full_access_enabled = full_access_default
                 alive = False
 
             if (
@@ -306,6 +315,7 @@ def restore_all(
                     model=state.model,
                     session_manager=session_manager,
                     web_search=False,
+                    full_access=state.full_access_enabled,
                 )
                 if not spawn_tmux_sync(
                     name=state.session_name,

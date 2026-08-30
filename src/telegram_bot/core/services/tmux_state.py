@@ -52,6 +52,9 @@ class TmuxSessionState:
     # Durable only while a one-shot research TUI is alive. restore_all uses
     # this marker to restart it with search disabled after a bot crash.
     web_search_enabled: bool = False
+    # True for historical sessions and when CODEX_FULL_ACCESS is enabled.
+    # A mismatch with the current default forces a fail-closed restart.
+    full_access_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,7 @@ def _normalize_state_dict(data: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("transcript_path", None)
     normalized.setdefault("base_mcp_config", normalized.get("mcp_config"))
     normalized.setdefault("web_search_enabled", False)
+    normalized.setdefault("full_access_enabled", True)
     return normalized
 
 

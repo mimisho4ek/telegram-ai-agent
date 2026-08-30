@@ -73,6 +73,27 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.research_approved_toast": "Research approved",
         "ui.research_denied": "🔒 Web research was not authorized.",
         "ui.research_approval_stale": "This research request is no longer active.",
+        "ui.full_access_armed": (
+            "⚠️ Unrestricted Codex access is enabled for the next task only. "
+            "It will return to the workspace sandbox afterward."
+        ),
+        "ui.full_access_disabled": "🔒 Codex is running in the workspace sandbox.",
+        "ui.full_access_status_global": (
+            "⚠️ Full access is enabled globally by CODEX_FULL_ACCESS=true."
+        ),
+        "ui.full_access_status_active": "⚠️ Full access is active for the task in progress.",
+        "ui.full_access_status_pending": "⚠️ Full access is authorized for the next task.",
+        "ui.full_access_status_sandboxed": "🔒 Codex is running in the workspace sandbox.",
+        "ui.full_access_global_hint": (
+            "Full access is enabled globally. Set CODEX_FULL_ACCESS=false and restart the bot "
+            "to use one-shot /fullaccess grants."
+        ),
+        "ui.full_access_already_global": (
+            "Full access is already enabled globally by CODEX_FULL_ACCESS=true."
+        ),
+        "ui.full_access_codex_only": "⚠️ /fullaccess is available only for Codex.",
+        "ui.full_access_failed": "❌ Couldn't enable one-shot full access. Try again.",
+        "ui.full_access_usage": "Use /fullaccess, /fullaccess status, or /fullaccess off.",
         "ui.engine_starting": (
             "🔄 {engine} is starting up — please wait a few seconds before sending."
         ),
@@ -366,6 +387,27 @@ MESSAGES: dict[str, dict[str, str]] = {
         "ui.research_approved_toast": "Поиск разрешён",
         "ui.research_denied": "🔒 Веб-ресерч не разрешён.",
         "ui.research_approval_stale": "Этот запрос на ресерч уже неактуален.",
+        "ui.full_access_armed": (
+            "⚠️ Полный доступ Codex включён только для следующей задачи. "
+            "После неё вернётся sandbox рабочей директории."
+        ),
+        "ui.full_access_disabled": "🔒 Codex работает в sandbox рабочей директории.",
+        "ui.full_access_status_global": (
+            "⚠️ Полный доступ включён глобально: CODEX_FULL_ACCESS=true."
+        ),
+        "ui.full_access_status_active": "⚠️ Полный доступ активен для выполняемой задачи.",
+        "ui.full_access_status_pending": "⚠️ Полный доступ разрешён для следующей задачи.",
+        "ui.full_access_status_sandboxed": ("🔒 Codex работает в sandbox рабочей директории."),
+        "ui.full_access_global_hint": (
+            "Полный доступ включён глобально. Установи CODEX_FULL_ACCESS=false и перезапусти "
+            "бота, чтобы использовать одноразовую команду /fullaccess."
+        ),
+        "ui.full_access_already_global": (
+            "Полный доступ уже включён глобально через CODEX_FULL_ACCESS=true."
+        ),
+        "ui.full_access_codex_only": "⚠️ /fullaccess доступна только для Codex.",
+        "ui.full_access_failed": "❌ Не удалось включить одноразовый полный доступ. Повтори.",
+        "ui.full_access_usage": ("Используй /fullaccess, /fullaccess status или /fullaccess off."),
         "ui.engine_starting": (
             "🔄 {engine} запускается — подожди несколько секунд перед отправкой."
         ),

@@ -32,6 +32,7 @@ from telegram_bot.core.keyboards import (
 from telegram_bot.core.messages import reset_lang_cache, t
 from telegram_bot.core.services.claude import SessionManager
 from telegram_bot.core.services.codex_update import CodexUpdateResult, CodexUpdateService
+from telegram_bot.core.services.full_access_grants import FullAccessGrantStore
 from telegram_bot.core.services.message_queue import MessageQueue
 from telegram_bot.core.services.picker_store import PickerState, PickerStore
 from telegram_bot.core.services.providers import engine_display_name
@@ -292,8 +293,12 @@ async def handle_new(
     forward_batcher: ForwardBatcher,
     tmux_manager: TmuxManager,
     topic_config: TopicConfig,
+    research_grants: ResearchGrantStore,
+    full_access_grants: FullAccessGrantStore,
 ) -> None:
     key = channel_key(message)
+    research_grants.clear(key)
+    full_access_grants.clear(key)
     logger.debug("User %s requested new session", message.from_user and message.from_user.id)
     await _reset_channel(
         message, key, session_manager, message_queue, forward_batcher, tmux_manager, topic_config
@@ -309,9 +314,11 @@ async def handle_clear(
     tmux_manager: TmuxManager,
     topic_config: TopicConfig,
     research_grants: ResearchGrantStore,
+    full_access_grants: FullAccessGrantStore,
 ) -> None:
     key = channel_key(message)
     research_grants.clear(key)
+    full_access_grants.clear(key)
     logger.debug("User %s requested clear", message.from_user and message.from_user.id)
     await _reset_channel(
         message, key, session_manager, message_queue, forward_batcher, tmux_manager, topic_config
@@ -325,9 +332,11 @@ async def handle_cancel_command(
     message_queue: MessageQueue,
     tmux_manager: TmuxManager,
     research_grants: ResearchGrantStore,
+    full_access_grants: FullAccessGrantStore,
 ) -> None:
     key = channel_key(message)
     research_grants.clear(key)
+    full_access_grants.clear(key)
     tmux_acted = tmux_manager.is_active(key)
     if tmux_acted:
         await tmux_manager.cancel(key)
@@ -344,10 +353,12 @@ async def handle_kill(
     message: Message,
     tmux_manager: TmuxManager,
     research_grants: ResearchGrantStore,
+    full_access_grants: FullAccessGrantStore,
 ) -> None:
     """Kill the tmux session in the current topic."""
     key = channel_key(message)
     research_grants.clear(key)
+    full_access_grants.clear(key)
     if not tmux_manager.is_active(key):
         await message.answer(t("ui.tmux_not_active"))
         return
@@ -468,6 +479,74 @@ async def on_research_approval(
         with contextlib.suppress(TelegramBadRequest):
             await callback.message.edit_text(t("ui.research_approved"), reply_markup=None)
     await callback.answer(t("ui.research_approved_toast"))
+
+
+@router.message(Command("fullaccess"))
+async def handle_full_access(
+    message: Message,
+    tmux_manager: TmuxManager,
+    session_manager: SessionManager,
+    message_queue: MessageQueue,
+    full_access_grants: FullAccessGrantStore,
+) -> None:
+    """Authorize unrestricted Codex execution for exactly the next task."""
+    key = channel_key(message)
+    arg = (message.text or "").split(maxsplit=1)
+    action = arg[1].strip().lower() if len(arg) > 1 else "next"
+
+    if action == "status":
+        if tmux_manager.codex_full_access_default:
+            await message.answer(t("ui.full_access_status_global"))
+        elif tmux_manager.is_full_access_enabled(key):
+            await message.answer(t("ui.full_access_status_active"))
+        elif full_access_grants.is_pending(key):
+            await message.answer(t("ui.full_access_status_pending"))
+        else:
+            await message.answer(t("ui.full_access_status_sandboxed"))
+        return
+
+    if action == "off":
+        if tmux_manager.codex_full_access_default:
+            await message.answer(t("ui.full_access_global_hint"))
+            return
+        if tmux_manager.is_processing(key) or message_queue.is_busy(key):
+            await message.answer(t("ui.exec_mode_busy"))
+            return
+        full_access_grants.clear(key)
+        await tmux_manager.disable_full_access(key, session_manager)
+        await message.answer(t("ui.full_access_disabled"))
+        return
+
+    if action not in {"next", "on"}:
+        await message.answer(t("ui.full_access_usage"))
+        return
+    if tmux_manager.codex_full_access_default:
+        await message.answer(t("ui.full_access_already_global"))
+        return
+
+    provider, _model = tmux_manager.get_provider_model(key)
+    if provider is None:
+        provider = session_manager._get_session(key).engine
+    if provider != "codex":
+        await message.answer(t("ui.full_access_codex_only"))
+        return
+    if tmux_manager.is_processing(key) or message_queue.is_busy(key):
+        await message.answer(t("ui.exec_mode_busy"))
+        return
+
+    if tmux_manager.is_active(key):
+        try:
+            enabled = await tmux_manager.enable_full_access(key, session_manager)
+        except RuntimeError:
+            logger.warning("full-access enable failed for %s", key, exc_info=True)
+            await message.answer(t("ui.full_access_failed"))
+            return
+        if not enabled:
+            await message.answer(t("ui.full_access_failed"))
+            return
+    else:
+        full_access_grants.arm(key)
+    await message.answer(t("ui.full_access_armed"))
 
 
 @router.message(Command("recycle"))
@@ -937,6 +1016,7 @@ async def on_engine_click(
     message_queue: MessageQueue,
     session_manager: SessionManager,
     research_grants: ResearchGrantStore,
+    full_access_grants: FullAccessGrantStore,
 ) -> None:
     """Apply provider engine changes for the picker topic."""
     if callback.data is None or callback.message is None:
@@ -968,6 +1048,7 @@ async def on_engine_click(
         return
 
     research_grants.clear(key)
+    full_access_grants.clear(key)
     if current.models:
         ok = await topic_config.update_engine(thread_id, new_engine)
     else:

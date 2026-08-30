@@ -172,6 +172,7 @@ CC_INACTIVITY_KILL_SEC=1800
 CODEX_AUTO_UPDATE_ENABLED=true
 CODEX_UPDATE_TIMEOUT_SEC=180
 CODEX_UPDATE_COOLDOWN_SEC=86400
+CODEX_FULL_ACCESS=true
 ```
 
 Пояснения:
@@ -189,6 +190,10 @@ CODEX_UPDATE_COOLDOWN_SEC=86400
 - `DEEPGRAM_API_KEY`: оставьте пустым, если не нужны voice messages.
 - `CODEX_AUTO_UPDATE_ENABLED`: включает автоматические и ручные обновления
   Codex. Timeout ограничивает любое обновление, cooldown — только автоматические.
+- `CODEX_FULL_ACCESS`: неограниченный доступ Codex к файловой системе и shell.
+  По умолчанию `true` для обратной совместимости. При `false` используется
+  workspace-write sandbox без сети для shell-команд, а `/fullaccess` может
+  повысить права только следующей задачи.
 
 Запустите в foreground:
 
@@ -409,6 +414,10 @@ Slash commands устроены отдельно: в tmux topics non-bot command
   определит, что задаче нужны актуальные внешние данные, бот также покажет
   кнопки **«Разрешить один раз»** / **«Отказать»**. После подтверждения исходная
   задача повторится автоматически, а разрешение истечёт после её завершения.
+- `/fullaccess`: при `CODEX_FULL_ACCESS=false` разрешить Codex неограниченный
+  доступ к файловой системе и shell только для следующей задачи.
+  `/fullaccess status` показывает режим, `/fullaccess off` отзывает ожидающий
+  допуск. Это разрешение не включает `/research` автоматически.
 - `/stream`: только forum topics; выбрать `verbose`, `live` или `minimal`.
 - `/resume`: только forum topics; возобновить сохраненную tmux session для cwd
   текущего topic.

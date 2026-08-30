@@ -34,6 +34,7 @@ from telegram_bot.core.middleware.auth import AuthMiddleware
 from telegram_bot.core.services.bot_commands import setup_bot_commands
 from telegram_bot.core.services.claude import SessionManager
 from telegram_bot.core.services.codex_update import CodexUpdateService
+from telegram_bot.core.services.full_access_grants import FullAccessGrantStore
 from telegram_bot.core.services.message_queue import MessageQueue
 from telegram_bot.core.services.picker_store import PickerStore
 from telegram_bot.core.services.research_grants import ResearchGrantStore
@@ -140,6 +141,7 @@ async def process_queue_item(
     session_manager: SessionManager,
     tmux_manager: TmuxManager,
     research_grants: ResearchGrantStore,
+    full_access_grants: FullAccessGrantStore,
     research_grant: bool = False,
     start_new_session: bool = False,
 ) -> None:
@@ -199,6 +201,7 @@ async def process_queue_item(
 
     reply_message = source_messages[-1] if source_messages else None
     if reply_message is None:
+        full_access_grants.consume(channel_key)
         return
     try:
         await send_streaming_response(
@@ -210,6 +213,9 @@ async def process_queue_item(
             research_grants=research_grants,
         )
     finally:
+        # A one-shot full-access grant belongs to this queue item even if
+        # Codex disappeared and the runtime fell back before consuming it.
+        full_access_grants.consume(channel_key)
         if research_grant:
             # If Codex never launched (for example it disappeared before an
             # automatic retry), do not let this approval leak to a later task.
@@ -236,9 +242,12 @@ async def _start() -> None:
     _ensure_dedicated_tmux_tmpdir(workspace_root, tmux_sessions_dir)
     topic_config = TopicConfig(str(topic_config_path), str(workspace_root))
     research_grants = ResearchGrantStore()
+    full_access_grants = FullAccessGrantStore()
     tmux_manager = TmuxManager(
         sessions_dir=tmux_sessions_dir,
         research_grants=research_grants,
+        full_access_grants=full_access_grants,
+        codex_full_access=settings.codex_full_access,
     )
     codex_update_service = CodexUpdateService(
         state_path=tmux_sessions_dir / "codex_update.json",
@@ -252,6 +261,7 @@ async def _start() -> None:
         settings,
         topic_config=topic_config,
         research_grants=research_grants,
+        full_access_grants=full_access_grants,
     )
     tmux_manager.restore_all(session_manager)
     picker_store = PickerStore()
@@ -280,6 +290,7 @@ async def _start() -> None:
             session_manager=session_manager,
             tmux_manager=tmux_manager,
             research_grants=research_grants,
+            full_access_grants=full_access_grants,
             research_grant=research_grant,
             start_new_session=start_new_session,
         )
@@ -317,6 +328,7 @@ async def _start() -> None:
     dp["codex_update_service"] = codex_update_service
     dp["picker_store"] = picker_store
     dp["research_grants"] = research_grants
+    dp["full_access_grants"] = full_access_grants
     dp["bot_defaults"] = bot_defaults
 
     ensure_tmp_dir(session_manager.file_cache_dir)

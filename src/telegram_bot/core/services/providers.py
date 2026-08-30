@@ -153,6 +153,20 @@ def _codex_tui_prefix() -> list[str]:
     return codex_env_prefix()
 
 
+def codex_permission_args(*, full_access: bool) -> list[str]:
+    """Build an explicit Codex execution policy for one process."""
+    if full_access:
+        return ["--dangerously-bypass-approvals-and-sandbox"]
+    return [
+        "-c",
+        'sandbox_mode="workspace-write"',
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        "sandbox_workspace_write.network_access=false",
+    ]
+
+
 def _configured_codex_binary() -> Path | None:
     configured = os.getenv("TELEGRAM_CODEX_BIN") or os.getenv("CODEX_BINARY_PATH")
     if not configured:
@@ -341,6 +355,7 @@ class ProviderAdapter(Protocol):
         model: str | None = None,
         mcp_config: str | None = None,
         web_search: bool = False,
+        full_access: bool = True,
     ) -> list[str]: ...
 
     def build_tui_resume(
@@ -351,6 +366,7 @@ class ProviderAdapter(Protocol):
         model: str | None = None,
         mcp_config: str | None = None,
         web_search: bool = False,
+        full_access: bool = True,
     ) -> list[str]: ...
 
     def parse_tui_event(self, raw: str) -> TuiParseResult: ...
@@ -674,6 +690,7 @@ class CodexAdapter:
         model: str | None = None,
         mcp_config: str | None = None,
         web_search: bool = False,
+        full_access: bool = True,
     ) -> list[str]:
         codex_home = _CODEX_BOT_HOME if _use_codex_bot_home() else _CODEX_HOME
         inherited_servers = discover_codex_mcp_server_names(cwd, codex_home=codex_home)
@@ -686,8 +703,8 @@ class CodexAdapter:
             ),
             "-c",
             f'web_search="{"live" if web_search else "disabled"}"',
+            *codex_permission_args(full_access=full_access),
             "--no-alt-screen",
-            "--dangerously-bypass-approvals-and-sandbox",
             "--cd",
             cwd,
         ]
@@ -703,6 +720,7 @@ class CodexAdapter:
         model: str | None = None,
         mcp_config: str | None = None,
         web_search: bool = False,
+        full_access: bool = True,
     ) -> list[str]:
         codex_home = _CODEX_BOT_HOME if _use_codex_bot_home() else _CODEX_HOME
         inherited_servers = discover_codex_mcp_server_names(cwd, codex_home=codex_home)
@@ -716,9 +734,9 @@ class CodexAdapter:
             ),
             "-c",
             f'web_search="{"live" if web_search else "disabled"}"',
+            *codex_permission_args(full_access=full_access),
             session_id,
             "--no-alt-screen",
-            "--dangerously-bypass-approvals-and-sandbox",
             "--cd",
             cwd,
         ]

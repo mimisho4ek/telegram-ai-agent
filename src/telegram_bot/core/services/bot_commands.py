@@ -46,6 +46,11 @@ PUBLIC_BOT_COMMANDS: tuple[LocalizedBotCommand, ...] = (
         "Разрешить веб-поиск для следующей задачи",
         "Allow web search for the next task",
     ),
+    LocalizedBotCommand(
+        "fullaccess",
+        "Полный доступ для следующей задачи",
+        "Full access for the next task",
+    ),
     LocalizedBotCommand("resume", "Возобновить сохраненную сессию", "Resume a saved session"),
     LocalizedBotCommand("kill", "Остановить tmux-сессию", "Stop the tmux session"),
     LocalizedBotCommand("recycle", "Перезапустить runtime топика", "Restart topic runtime"),

@@ -56,6 +56,7 @@ from typing import Literal, cast
 from telegram_bot.core.messages import t
 from telegram_bot.core.services.bot_mcp_runtime import ensure_bot_runtime_mcp_config
 from telegram_bot.core.services.claude import Mode, StreamEvent
+from telegram_bot.core.services.full_access_grants import FullAccessGrantStore
 from telegram_bot.core.services.process_cleanup import cleanup_tmux_runtime, runtime_diagnostics
 from telegram_bot.core.services.providers import (
     CODEX_ADAPTER,
@@ -252,10 +253,14 @@ class TmuxManager:
         *,
         session_name_prefix: str = "cc-",
         research_grants: ResearchGrantStore | None = None,
+        full_access_grants: FullAccessGrantStore | None = None,
+        codex_full_access: bool = True,
     ) -> None:
         self._sessions_dir = sessions_dir
         self._session_name_prefix = session_name_prefix
         self._research_grants = research_grants
+        self._full_access_grants = full_access_grants
+        self._codex_full_access_default = codex_full_access
         self._sessions: dict[ChannelKey, TmuxSessionState] = {}
         self._cancel_events: dict[ChannelKey, asyncio.Event] = {}
         self._is_processing: dict[ChannelKey, bool] = {}
@@ -529,6 +534,14 @@ class TmuxManager:
         state = self._sessions.get(channel_key)
         return bool(state and state.provider == "codex" and state.web_search_enabled)
 
+    def is_full_access_enabled(self, channel_key: ChannelKey) -> bool:
+        state = self._sessions.get(channel_key)
+        return bool(state and state.provider == "codex" and state.full_access_enabled)
+
+    @property
+    def codex_full_access_default(self) -> bool:
+        return self._codex_full_access_default
+
     def active_session_count(self) -> int:
         """Number of channels with a tracked tmux session.
 
@@ -737,6 +750,11 @@ class TmuxManager:
             and self._research_grants
             and self._research_grants.consume(channel_key)
         )
+        full_access_enabled = self._codex_full_access_default or bool(
+            provider == "codex"
+            and self._full_access_grants
+            and self._full_access_grants.consume(channel_key)
+        )
         if provider == "codex":
             if resume_session_id is None:
                 await self._maybe_auto_update_codex(channel_key)
@@ -748,6 +766,7 @@ class TmuxManager:
                     model=model,
                     mcp_config=mcp_config,
                     web_search=web_search_enabled,
+                    full_access=full_access_enabled,
                 )
                 current_state = self._sessions.get(channel_key)
                 saved_path = CODEX_ADAPTER.transcript_path_for_state(
@@ -764,6 +783,7 @@ class TmuxManager:
                     model=model,
                     mcp_config=mcp_config,
                     web_search=web_search_enabled,
+                    full_access=full_access_enabled,
                 )
                 initial_offset = 0
         elif resume_session_id is not None:
@@ -803,6 +823,7 @@ class TmuxManager:
             transcript_path=transcript_abs,
             base_mcp_config=base_mcp_config,
             web_search_enabled=web_search_enabled,
+            full_access_enabled=full_access_enabled,
         )
 
         # User-facing loading status: codex/claude TUI cold-start can take
@@ -2547,14 +2568,8 @@ class TmuxManager:
             if self._cancel_events.get(channel_key) is cancel_event:
                 self._cancel_events.pop(channel_key, None)
             self.clear_processing(channel_key)
-            current = self._sessions.get(channel_key)
-            if (
-                session_manager is not None
-                and current is not None
-                and current.provider == "codex"
-                and current.web_search_enabled
-            ):
-                await self.disable_research(channel_key, session_manager)
+            if session_manager is not None:
+                await self.reset_one_shot_permissions(channel_key, session_manager)
 
     async def cancel(self, channel_key: ChannelKey) -> None:
         """Interrupt CC processing and cancel the tail loop.
@@ -2658,6 +2673,8 @@ class TmuxManager:
 
         candidate = replace(state)
         if candidate.provider == "codex":
+            candidate.web_search_enabled = False
+            candidate.full_access_enabled = self._codex_full_access_default
             candidate.base_mcp_config = self._effective_base_mcp_config(
                 channel_key=channel_key,
                 base_mcp_config=candidate.base_mcp_config or candidate.mcp_config,
@@ -2674,6 +2691,7 @@ class TmuxManager:
                 cwd=candidate.cwd,
                 model=candidate.model,
                 mcp_config=candidate.mcp_config,
+                full_access=candidate.full_access_enabled,
             )
             candidate.session_id = None
             candidate.transcript_path = None
@@ -2801,11 +2819,14 @@ class TmuxManager:
             session_manager=session_manager,
         )
         if candidate.provider == "codex":
+            candidate.web_search_enabled = False
+            candidate.full_access_enabled = self._codex_full_access_default
             startup_cmd = CODEX_ADAPTER.build_tui_resume(
                 cwd=candidate.cwd,
                 session_id=new_session_id,
                 model=candidate.model,
                 mcp_config=candidate.mcp_config,
+                full_access=candidate.full_access_enabled,
             )
         else:
             startup_cmd = session_manager.build_tmux_startup_args(  # type: ignore[attr-defined]
@@ -2940,6 +2961,8 @@ class TmuxManager:
             new_state.session_name = replacement_name
             new_state.session_dir = str(replacement_dir)
             new_state.base_mcp_config = runtime.mcp_config
+            if target_provider == "codex":
+                new_state.full_access_enabled = self._codex_full_access_default
             startup_cmd = build_resume_startup_cmd(
                 target_provider,
                 cwd=runtime.cwd,
@@ -2948,6 +2971,7 @@ class TmuxManager:
                 mcp_config=runtime_for_resume.mcp_config,
                 model=runtime.model,
                 session_manager=session_manager,
+                full_access=new_state.full_access_enabled,
             )
             try:
                 await self._spawn_tmux(
@@ -3046,6 +3070,7 @@ class TmuxManager:
                         model=candidate.model,
                         mcp_config=candidate.mcp_config,
                         web_search=candidate.web_search_enabled,
+                        full_access=candidate.full_access_enabled,
                     )
                 else:
                     startup_cmd = CODEX_ADAPTER.build_tui_start(
@@ -3053,6 +3078,7 @@ class TmuxManager:
                         model=candidate.model,
                         mcp_config=candidate.mcp_config,
                         web_search=candidate.web_search_enabled,
+                        full_access=candidate.full_access_enabled,
                     )
             elif resume_id:
                 startup_cmd = session_manager.build_tmux_startup_args(  # type: ignore[attr-defined]
@@ -3136,6 +3162,59 @@ class TmuxManager:
             logger.exception("Failed to restart Codex without web search for %s", channel_key)
             # Do not leave a live TUI with research permission after a reset
             # failure. The next normal message will lazily start disabled.
+            await self.kill(channel_key)
+
+    async def enable_full_access(self, channel_key: ChannelKey, session_manager: object) -> bool:
+        """Restart a live Codex TUI with unrestricted access for its next turn."""
+        state = self._sessions.get(channel_key)
+        if state is None or state.provider != "codex" or not self.is_active(channel_key):
+            return False
+        state.full_access_enabled = True
+        self._save_state()
+        try:
+            return await self.recycle(channel_key, session_manager)
+        except Exception:
+            state = self._sessions.get(channel_key)
+            if state is not None:
+                state.full_access_enabled = self._codex_full_access_default
+                self._save_state()
+            raise
+
+    async def disable_full_access(self, channel_key: ChannelKey, session_manager: object) -> None:
+        """Return a one-shot unrestricted TUI to the configured default sandbox."""
+        state = self._sessions.get(channel_key)
+        if (
+            state is None
+            or state.provider != "codex"
+            or self._codex_full_access_default
+            or not state.full_access_enabled
+        ):
+            return
+        state.full_access_enabled = False
+        self._save_state()
+        try:
+            await self.recycle(channel_key, session_manager)
+        except Exception:
+            logger.exception("Failed to restore Codex sandbox for %s", channel_key)
+            await self.kill(channel_key)
+
+    async def reset_one_shot_permissions(
+        self, channel_key: ChannelKey, session_manager: object
+    ) -> None:
+        """Reset research and elevation together with at most one TUI restart."""
+        state = self._sessions.get(channel_key)
+        if state is None or state.provider != "codex":
+            return
+        expected_full_access = self._codex_full_access_default
+        if not state.web_search_enabled and state.full_access_enabled == expected_full_access:
+            return
+        state.web_search_enabled = False
+        state.full_access_enabled = expected_full_access
+        self._save_state()
+        try:
+            await self.recycle(channel_key, session_manager)
+        except Exception:
+            logger.exception("Failed to reset one-shot Codex permissions for %s", channel_key)
             await self.kill(channel_key)
 
     async def _kill_session_unlocked(self, channel_key: ChannelKey) -> None:

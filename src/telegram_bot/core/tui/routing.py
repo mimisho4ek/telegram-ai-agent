@@ -31,6 +31,7 @@ BOT_RESERVED_COMMANDS = frozenset(
         "/tui",
         "/codex_update",
         "/research",
+        "/fullaccess",
     }
 )
 
