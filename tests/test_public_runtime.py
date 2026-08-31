@@ -16,7 +16,7 @@ from telegram_bot.core.handlers import commands
 from telegram_bot.core.handlers.forum_topic import ExistingTopicRegistrationMiddleware
 from telegram_bot.core.handlers.tail import handle_tail_command
 from telegram_bot.core.keyboards import research_approval_keyboard
-from telegram_bot.core.services import cc_modes
+from telegram_bot.core.services import cc_modes, tmux_spawn
 from telegram_bot.core.services.bot_commands import build_bot_commands
 from telegram_bot.core.services.claude import SessionManager
 from telegram_bot.core.services.full_access_grants import FullAccessGrantStore
@@ -71,6 +71,31 @@ def test_public_entrypoint_selects_dedicated_tmux_server(tmp_path: Path, monkeyp
     assert runtime_dir == tmp_path / ".telegram-bot-tmux"
     assert runtime_dir.stat().st_mode & 0o777 == 0o700
     assert entrypoint.os.environ["TMUX_TMPDIR"] == str(runtime_dir)
+
+
+def test_sync_tmux_spawn_cleans_duplicate_and_retries_once(tmp_path: Path, monkeypatch) -> None:
+    cleanup = MagicMock(return_value=0)
+    run = MagicMock(
+        side_effect=[
+            MagicMock(returncode=1, stderr="duplicate session: cc-n1-2"),
+            MagicMock(returncode=0, stderr=""),
+        ]
+    )
+    monkeypatch.setattr(tmux_spawn, "cleanup_tmux_runtime", cleanup)
+    monkeypatch.setattr(tmux_spawn, "sanitized_tmux_environment", lambda **_kwargs: {})
+    monkeypatch.setattr(tmux_spawn.subprocess, "run", run)
+    monkeypatch.setattr(tmux_spawn.time, "sleep", lambda _seconds: None)
+
+    spawned = tmux_spawn.spawn_tmux_sync(
+        name="cc-n1-2",
+        session_dir=tmp_path / "session",
+        cwd=str(tmp_path),
+        startup_cmd=["env", "-i", "codex"],
+    )
+
+    assert spawned is True
+    assert cleanup.call_count == 2
+    assert run.call_count == 2
 
 
 def test_public_entrypoint_migrates_only_state_owned_legacy_tmux_sessions(

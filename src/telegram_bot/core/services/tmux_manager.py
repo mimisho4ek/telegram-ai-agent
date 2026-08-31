@@ -96,6 +96,9 @@ from telegram_bot.core.services.tmux_spawn import (
     SPAWN_READINESS_BUDGET_SEC as _SPAWN_READINESS_BUDGET_SEC,
 )
 from telegram_bot.core.services.tmux_spawn import (
+    TMUX_NEW_SESSION_DUPLICATE_ERROR as _TMUX_NEW_SESSION_DUPLICATE_ERROR,
+)
+from telegram_bot.core.services.tmux_spawn import (
     TMUX_NEW_SESSION_RETRY_DELAY_SEC as _TMUX_NEW_SESSION_RETRY_DELAY_SEC,
 )
 from telegram_bot.core.services.tmux_spawn import (
@@ -976,10 +979,27 @@ class TmuxManager:
         )
         if result.returncode != 0:
             stderr = result.stderr.strip()
+            duplicate = _TMUX_NEW_SESSION_DUPLICATE_ERROR in stderr.lower()
+            transient = any(marker in stderr for marker in _TMUX_NEW_SESSION_TRANSIENT_ERRORS)
+            # A crashed/restarting process can leave the deterministic topic
+            # name visible between cleanup and new-session. Remove that exact
+            # bot-owned session once more. If another bot process keeps
+            # recreating it, the second attempt still fails loudly.
+            if duplicate:
+                logger.warning(
+                    "tmux duplicate session for %s; cleaning and retrying once",
+                    name,
+                )
+                await asyncio.to_thread(
+                    cleanup_tmux_runtime,
+                    session_name=name,
+                    channel_key=channel_key,
+                    runtime_path=str(session_dir / "mcp.runtime.json"),
+                )
             # When `kill-session` removed the last session on the server,
             # tmux shuts the server down (exit-empty on); a racing
             # `new-session` sees "server exited unexpectedly". Retry once.
-            if any(marker in stderr for marker in _TMUX_NEW_SESSION_TRANSIENT_ERRORS):
+            if duplicate or transient:
                 logger.warning(
                     "tmux new-session transient failure for %s (%r); retrying once",
                     name,

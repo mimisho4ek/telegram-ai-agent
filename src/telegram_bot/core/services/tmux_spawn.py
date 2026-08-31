@@ -19,6 +19,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -41,6 +42,7 @@ TMUX_NEW_SESSION_TRANSIENT_ERRORS = (
     "error connecting",
 )
 TMUX_NEW_SESSION_RETRY_DELAY_SEC = 0.2
+TMUX_NEW_SESSION_DUPLICATE_ERROR = "duplicate session"
 
 # Modal watchdog cadence. Every MODAL_WATCHDOG_INTERVAL_SEC the watchdog
 # walks all active sessions, captures their pane, and posts an idle-modal
@@ -213,6 +215,39 @@ def spawn_tmux_sync(
             cwd=cwd,
             env=tmux_env,
         )
+        if (
+            result.returncode != 0
+            and TMUX_NEW_SESSION_DUPLICATE_ERROR in (result.stderr or "").lower()
+        ):
+            # A crashed/restarting bot can leave the deterministic per-topic
+            # session name visible for a short window. Clean that exact
+            # bot-owned session once more and retry; a persistent duplicate is
+            # left as a failure because it usually means two bot processes are
+            # running concurrently.
+            logger.warning("Removing duplicate tmux session %s before one retry", name)
+            cleanup_tmux_runtime(
+                session_name=name,
+                runtime_path=str(session_dir / "mcp.runtime.json"),
+            )
+            time.sleep(TMUX_NEW_SESSION_RETRY_DELAY_SEC)
+            result = subprocess.run(
+                [
+                    "tmux",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    name,
+                    "-x",
+                    "200",
+                    "-y",
+                    "50",
+                    *sanitized_startup,
+                ],
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+                env=tmux_env,
+            )
     except Exception:
         logger.warning("tmux spawn raised for %s", name, exc_info=True)
         return False
